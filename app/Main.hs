@@ -1,4 +1,4 @@
--- {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE LambdaCase #-}
 -- {-# LANGUAGE BlockArguments #-}
 -- {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeApplications #-}
@@ -13,18 +13,22 @@
 module Main where
 
 import Control.Applicative (Alternative,(<|>),empty)
-import Control.Arrow (first,second)
+-- import Control.Arrow (first,second)
 import Control.Monad (MonadPlus,mzero,mplus)
+-- import Control.Monad.Except
 import Control.Monad.IO.Class (MonadIO,liftIO)
 import Control.Monad.Trans
 import Control.Monad.State.Strict (StateT,evalStateT,modify,get)
+import Data.Bifunctor (first,second)
 import Data.Complex
 import Data.Functor (void)
 import Data.Functor.Identity
 import qualified Data.List.NonEmpty as NE
+import Data.Maybe (listToMaybe)
 import Data.Void (Void)
 import Data.Ratio (Ratio,(%),numerator,denominator)
 import System.Environment (getArgs)
+import System.IO (hFlush,stdout)
 
 import           Text.Megaparsec
 import           Text.Megaparsec.Char
@@ -72,9 +76,9 @@ upcast 3 (Rational r) = Double   $ realToFrac   <$> r
 upcast 3 (Float    f) = Double   $ realToFrac   <$> f
 upcast _ _            = error "upcast: down casting"
 
-binNumOpR :: forall rc. (forall a. Num a => a -> a -> CanBeComplex rc a)
+binOpNumR :: forall rc. (forall a. Num a => a -> a -> CanBeComplex rc a)
           -> Number 'R -> Number 'R -> Number rc
-binNumOpR op a b = match (upcast upper a) (upcast upper b)
+binOpNumR op a b = match (upcast upper a) (upcast upper b)
   where
     upper = max (conversionOrder a) (conversionOrder b)
     match :: Number 'R -> Number 'R -> Number rc
@@ -82,11 +86,11 @@ binNumOpR op a b = match (upcast upper a) (upcast upper b)
     match (Rational (CBReal x)) (Rational (CBReal y)) = Rational $ x `op` y
     match (Float    (CBReal x)) (Float    (CBReal y)) = Float    $ x `op` y
     match (Double   (CBReal x)) (Double   (CBReal y)) = Double   $ x `op` y
-    match _ _ = error "binNumOpR: match: upcast is broken"
+    match _ _ = error "binOpNumR: match: upcast is broken"
 
-binNumOpC :: forall rc. (forall a. Num a => Complex a -> Complex a -> CanBeComplex rc a)
+binOpNumC :: forall rc. (forall a. Num a => Complex a -> Complex a -> CanBeComplex rc a)
           -> Number 'C -> Number 'C -> Number rc
-binNumOpC op a b = match (upcast upper a) (upcast upper b)
+binOpNumC op a b = match (upcast upper a) (upcast upper b)
   where
     upper = max (conversionOrder a) (conversionOrder b)
     match :: Number 'C -> Number 'C -> Number rc
@@ -94,7 +98,7 @@ binNumOpC op a b = match (upcast upper a) (upcast upper b)
     match (Rational (CBComp x)) (Rational (CBComp y)) = Rational $ x `op` y
     match (Float    (CBComp x)) (Float    (CBComp y)) = Float    $ x `op` y
     match (Double   (CBComp x)) (Double   (CBComp y)) = Double   $ x `op` y
-    match _ _ = error "binNumOpR: match: upcast is broken"
+    match _ _ = error "binOpNumR: match: upcast is broken"
 
 data LispVal = Atom       String
              | List       [LispVal]
@@ -107,6 +111,9 @@ data LispVal = Atom       String
              deriving (Show,Eq)
 
 newtype PrettyLispVal = PrettyLispVal { unPrettyLispVal :: LispVal } deriving Eq
+
+unwordsList :: [LispVal] -> String
+unwordsList = unwords . fmap (show . PrettyLispVal)
 
 instance Show PrettyLispVal where
   show = showVal . unPrettyLispVal
@@ -127,15 +134,12 @@ instance Show PrettyLispVal where
       showReal (Float    (CBReal f)) = show f
       showReal (Double   (CBReal d)) = show d
 
-      unwordsList :: [LispVal] -> String
-      unwordsList = unwords . fmap (show . PrettyLispVal)
-
 maybeReal :: LispVal -> Maybe (Number 'R)
 maybeReal (Real r) = Just r
 maybeReal _        = Nothing
 
-integral :: Integer -> LispVal
-integral = Real . Integer . CBReal
+integer :: Integer -> LispVal
+integer = Real . Integer . CBReal
 
 rational :: Rational -> LispVal
 rational = Real . Rational . CBReal
@@ -146,7 +150,8 @@ float = Real . Float . CBReal
 double :: Double -> LispVal
 double = Real . Double . CBReal
 
-type Parser = ParsecT Void String Identity
+type Parser      = ParsecT Void String Identity
+type ParserError = ParseErrorBundle String Void
 
 skipLineComment :: Parser ()
 skipLineComment = L.skipLineComment ";"
@@ -190,10 +195,10 @@ parseHashPrefix = do
   choice $ (\(c, m) -> char c >> m) <$>
     [ ('t' , return $ Bool True)
     , ('f' , return $ Bool False)
-    , ('b' , integral  <$> signed L.binary)
-    , ('o' , integral  <$> signed L.octal)
-    , ('d' , integral  <$> signed L.decimal)
-    , ('x' , integral  <$> signed L.hexadecimal)
+    , ('b' , integer  <$> signed L.binary)
+    , ('o' , integer  <$> signed L.octal)
+    , ('d' , integer  <$> signed L.decimal)
+    , ('x' , integer  <$> signed L.hexadecimal)
     , ('\\', Character <$> anySingle)
     ]
 
@@ -241,7 +246,7 @@ parseReal defaultReal = signedDigitsString >>= \signedDigits ->
   choice $ flip evalStateT signedDigits <$>
     [ parseFractional defaultReal
     , parseRational
-    , get >>= return . integral . read
+    , get >>= return . integer . read
     ]
 
 -- TODO: parse dot-start fractional ".4e-1"
@@ -253,7 +258,7 @@ parseComplex defaultReal = parseReal defaultReal >>= \real -> do
       maybe empty return $ do
         r <- maybeReal real
         i <- maybeReal imag
-        return $ Complex $ binNumOpR (\r' i' -> CBComp $ r' :+ i') r i
+        return $ Complex $ binOpNumR (\r' i' -> CBComp $ r' :+ i') r i
   <|> return real
 
 parseInfNan :: (Fractional r, Read r) => (r -> LispVal) -> Parser LispVal
@@ -273,19 +278,19 @@ parseList = between (symbol "(") (char ')') $ sepEndBy parseExpr space1 >>= \hea
       return (DottedList head tail)
   <|> return (List head)
 
-appFunctionToParsedExpr :: String -> Parser LispVal
-appFunctionToParsedExpr f = List . (Atom f :) . pure <$> parseExpr
+appFuncToParsedExpr :: String -> Parser LispVal
+appFuncToParsedExpr f = List . (Atom f :) . pure <$> parseExpr
 
 parseQuoted :: Parser LispVal
-parseQuoted = char '\'' >> appFunctionToParsedExpr "quote"
+parseQuoted = char '\'' >> appFuncToParsedExpr "quote"
 
 parseQuasiquoted :: Parser LispVal
-parseQuasiquoted = char '`' >> appFunctionToParsedExpr "quasiquote"
+parseQuasiquoted = char '`' >> appFuncToParsedExpr "quasiquote"
 
 parseUnquoted :: Parser LispVal
 parseUnquoted = char ',' >> do
-      char '@' >> appFunctionToParsedExpr "unquote-splicing"
-  <|> appFunctionToParsedExpr "unquote"
+      char '@' >> appFuncToParsedExpr "unquote-splicing"
+  <|> appFuncToParsedExpr "unquote"
 
 parseExpr :: Parser LispVal
 parseExpr = choice
@@ -305,20 +310,147 @@ parseExpr = choice
 withRem :: MonadParsec e s m => m a -> m (a, s)
 withRem parser = (,) <$> parser <*> getInput
 
-readExpr :: String -> LispVal
-readExpr input =
-  case runIdentity (runParserT (parseExpr <* (sc >> eof)) "lisp" input) of
-    Left  err -> String $ "No match in "  ++ errorBundlePretty err
-    Right val -> val
+data LispError = NumArgs String Integer [LispVal]
+               | TypeMismatch String String LispVal
+               | Parser ParserError
+               | BadSpecialForm String LispVal
+               | NotFunction String String
+               | UnboundVar String String
+               | Default String
 
-eval :: LispVal -> LispVal
-eval (List [Atom "quote", val]) = val
-eval val = val
+instance Show LispError where
+  show (UnboundVar message varname)  = message ++ ": " ++ varname
+  show (BadSpecialForm message form) = message ++ ": " ++ show (PrettyLispVal form)
+  show (NotFunction message func)    = message ++ ": " ++ show func
+  show (NumArgs func expected found) = "Function "               ++ show func
+                                    ++ " expects "               ++ show expected
+                                    ++ " args; but applied to: " ++ unwordsList found
+  show (TypeMismatch fnc expctd fnd) = "Invalid type in "  ++ show fnc
+                                    ++ "; expected "       ++ expctd
+                                    ++ ", but found arg: " ++ show (PrettyLispVal fnd)
+  show (Parser parserErr)            = "Parse error:\n" ++ errorBundlePretty parserErr
+
+type LispErrOrVal = Either LispError LispVal
+
+readExpr :: String -> LispErrOrVal
+readExpr input =
+  first Parser $ runIdentity $ runParserT (parseExpr <* (sc >> eof)) "" input
+
+eval :: LispErrOrVal -> LispErrOrVal
+eval ev = ev >>= eval'
+  where
+    eval' :: LispVal -> LispErrOrVal
+    eval' (List [Atom "quote"     , val]) = return val
+    eval' (List [Atom "quasiquote", val]) = return val
+    eval' (List (Atom func : args))       = traverse eval' args >>= apply func
+    eval' (Atom name)                     = return $ String $ "Atom: " ++ name
+    eval' val                             = return val
+
+apply :: String -> [LispVal] -> LispErrOrVal
+apply func args = maybe (Left $ NotFunction "Unrecognized primitive function " func)
+                        ($ args)
+                        $ lookup func primitives
+
+primitives :: [(String, [LispVal] -> LispErrOrVal)]
+primitives = (\(name, func) -> (name, func name)) <$>
+  [ ("boolean?"      , isLispBool)
+  , ("string?"       , isLispString)
+  , ("char?"         , isLispCharacter)
+  , ("list?"         , isLispList)
+  , ("pair?"         , isLispDottedList)
+  , ("symbol?"       , isLispSymbol)
+  , ("not"           , notLispBool)
+  , ("null?"         , isNullLispList)
+  , ("symbol->string", symbol2String)
+  , ("string->symbol", string2Symbol)
+  , ("+"             , realBinOp (+) 0)
+  , ("-"             , realBinOp (-) 0)
+  , ("*"             , realBinOp (*) 1)
+  ]
+
+type LispFunction = String -> [LispVal] -> LispErrOrVal
+
+isLispBool :: LispFunction
+isLispBool _    [Bool _] = return $ Bool True
+isLispBool _    [_]      = return $ Bool False
+isLispBool name args     = Left   $ NumArgs name 1 args
+
+isLispString :: LispFunction
+isLispString _    [String _] = return $ Bool True
+isLispString _    [_]        = return $ Bool False
+isLispString name args       = Left   $ NumArgs name 1 args
+
+isLispCharacter :: LispFunction
+isLispCharacter _    [Character _] = return $ Bool True
+isLispCharacter _    [_]           = return $ Bool False
+isLispCharacter name args          = Left   $ NumArgs name 1 args
+
+isLispList :: LispFunction
+isLispList _    [List _] = return $ Bool True
+isLispList _    [_]      = return $ Bool False
+isLispList name args     = Left   $ NumArgs name 1 args
+
+isLispDottedList :: LispFunction
+isLispDottedList _    [DottedList _ _] = return $ Bool True
+isLispDottedList _    [_]              = return $ Bool False
+isLispDottedList name args             = Left   $ NumArgs name 1 args
+
+isLispSymbol :: LispFunction
+isLispSymbol _    [Atom _] = return $ Bool True
+isLispSymbol _    [_]      = return $ Bool False
+isLispSymbol name args     = Left   $ NumArgs name 1 args
+
+notLispBool :: LispFunction
+notLispBool _    [Bool True ] = return $ Bool False
+notLispBool _    [Bool False] = return $ Bool True
+notLispBool name [_]          = return $ Bool False
+notLispBool name args         = Left   $ NumArgs name 1 args
+
+isNullLispList :: LispFunction
+isNullLispList _    [List []] = return $ Bool True
+isNullLispList name [_]       = return $ Bool False
+isNullLispList name args      = Left   $ NumArgs name 1 args
+
+symbol2String :: LispFunction
+symbol2String _    [Atom name] = return $ String name
+symbol2String name [arg]       = Left   $ TypeMismatch name "symbol" arg
+symbol2String name args        = Left   $ NumArgs name 1 args
+
+string2Symbol :: LispFunction
+string2Symbol _    [String str] = return $ Atom str
+string2Symbol name [arg]        = Left   $ TypeMismatch name "string" arg
+string2Symbol name args         = Left   $ NumArgs name 1 args
+
+realBinOp :: forall rc. (forall a. Num a => a -> a -> a) -> Integer -> LispFunction
+realBinOp op init name args =
+  Real . foldl (binOpNumR $ \x y -> CBReal $ x `op` y) (Integer $ CBReal init)
+  <$> traverse (unpackReal name) args
+
+unpackReal :: String -> LispVal -> Either LispError (Number 'R)
+unpackReal _    (Real r) = return r
+unpackReal func arg      = Left $ TypeMismatch func "real number" arg
+{- Dynamic
+unpackReal (String str)  = either (const $ Integer $ CBReal 0) unpackReal $ readExpr str
+unpackReal (Character c) = either (const $ Integer $ CBReal 0) unpackReal $ readExpr [c]
+unpackReal (List [val])  = unpackReal val
+unpackReal _             = Integer $ CBReal 0
+-}
+
+printLispErrOrVal :: LispErrOrVal -> IO ()
+printLispErrOrVal = putStrLn . either show (show . PrettyLispVal)
+
+repl :: IO ()
+repl = do
+  putStrLn "~~~ Scheme REPL ~~~"
+  loop
+  where
+    loop = do
+      val  <- readExpr          <$> (putStr "> " >> hFlush stdout >> getLine)
+      val' <- eval              <$> return val
+      _    <- printLispErrOrVal  $  val'
+      loop
 
 main :: IO ()
-main = do
-  val <- readExpr <$> (putStr "> " >> getLine)
-  let val' = eval val
-  print $ PrettyLispVal val'
+main = listToMaybe <$> getArgs >>= maybe repl (printLispErrOrVal . eval . readExpr)
 
 -- main = undefined

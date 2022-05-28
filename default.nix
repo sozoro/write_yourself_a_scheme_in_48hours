@@ -13,6 +13,7 @@ in
   developPackage.overrideAttrs (oldAttrs: with nixpkgs; {
     buildInputs = oldAttrs.buildInputs ++ [
       pkgs.hlint
+      haskellPackages.cabal-install
     ];
     shellHook = ''
     '';
