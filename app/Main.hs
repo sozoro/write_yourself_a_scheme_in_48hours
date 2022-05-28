@@ -13,7 +13,9 @@
 module Main where
 
 import Control.Applicative (Alternative,(<|>),empty)
+import Control.Arrow (first,second)
 import Control.Monad (MonadPlus,mzero,mplus)
+import Control.Monad.IO.Class (MonadIO,liftIO)
 import Control.Monad.Trans
 import Control.Monad.State.Strict (StateT,evalStateT,modify,get)
 import Data.Complex
@@ -21,7 +23,7 @@ import Data.Functor (void)
 import Data.Functor.Identity
 import qualified Data.List.NonEmpty as NE
 import Data.Void (Void)
-import Data.Ratio (Ratio,(%))
+import Data.Ratio (Ratio,(%),numerator,denominator)
 import System.Environment (getArgs)
 
 import           Text.Megaparsec
@@ -104,6 +106,30 @@ data LispVal = Atom       String
              | Bool       Bool
              deriving (Show,Eq)
 
+newtype PrettyLispVal = PrettyLispVal { unPrettyLispVal :: LispVal } deriving Eq
+
+instance Show PrettyLispVal where
+  show = showVal . unPrettyLispVal
+    where
+      showVal :: LispVal -> String
+      showVal (Atom       name)  = name
+      showVal (String     str)   = "\"" ++ str ++ "\""
+      showVal (Real       r)     = showReal r
+      showVal (Complex    c)     = show c -- TODO
+      showVal (Bool       True)  = "#t"
+      showVal (Bool       False) = "#f"
+      showVal (List       ls)    = "(" ++ unwordsList ls ++ ")"
+      showVal (DottedList hd tl) = "(" ++ unwordsList hd ++ " . " ++ showVal tl ++ ")"
+
+      showReal :: Number 'R -> String
+      showReal (Integer  (CBReal i)) = show i
+      showReal (Rational (CBReal r)) = show (numerator r) ++ "/" ++ show (denominator r)
+      showReal (Float    (CBReal f)) = show f
+      showReal (Double   (CBReal d)) = show d
+
+      unwordsList :: [LispVal] -> String
+      unwordsList = unwords . fmap (show . PrettyLispVal)
+
 maybeReal :: LispVal -> Maybe (Number 'R)
 maybeReal (Real r) = Just r
 maybeReal _        = Nothing
@@ -122,11 +148,20 @@ double = Real . Double . CBReal
 
 type Parser = ParsecT Void String Identity
 
+skipLineComment :: Parser ()
+skipLineComment = L.skipLineComment ";"
+
+skipBlockComment :: Parser ()
+skipBlockComment = L.skipBlockComment "#|" "|#"
+
 sc :: Parser ()
-sc = L.space space1 (L.skipLineComment ";") (L.skipBlockComment "#|" "|#")
+sc = L.space space1 skipLineComment skipBlockComment
 
 lexeme :: Parser a -> Parser a
 lexeme = L.lexeme sc
+
+symbol :: String -> Parser String
+symbol = L.symbol sc
 
 signed :: Num a => Parser a -> Parser a
 signed = L.signed sc
@@ -209,6 +244,8 @@ parseReal defaultReal = signedDigitsString >>= \signedDigits ->
     , get >>= return . integral . read
     ]
 
+-- TODO: parse dot-start fractional ".4e-1"
+
 parseComplex :: (Fractional r, Read r) => (r -> LispVal) -> Parser LispVal
 parseComplex defaultReal = parseReal defaultReal >>= \real -> do
       imag <- parseReal defaultReal
@@ -229,13 +266,38 @@ parseInfNan defaultReal = defaultReal <$> choice
 whileNotAtom :: Parser a -> Parser a
 whileNotAtom parser = try $ parser <* notFollowedBy atomTailChar
 
+parseList :: Parser LispVal
+parseList = between (symbol "(") (char ')') $ sepEndBy parseExpr space1 >>= \head -> do
+      char '.' >> space1
+      tail <- parseExpr
+      return (DottedList head tail)
+  <|> return (List head)
+
+appFunctionToParsedExpr :: String -> Parser LispVal
+appFunctionToParsedExpr f = List . (Atom f :) . pure <$> parseExpr
+
+parseQuoted :: Parser LispVal
+parseQuoted = char '\'' >> appFunctionToParsedExpr "quote"
+
+parseQuasiquoted :: Parser LispVal
+parseQuasiquoted = char '`' >> appFunctionToParsedExpr "quasiquote"
+
+parseUnquoted :: Parser LispVal
+parseUnquoted = char ',' >> do
+      char '@' >> appFunctionToParsedExpr "unquote-splicing"
+  <|> appFunctionToParsedExpr "unquote"
+
 parseExpr :: Parser LispVal
 parseExpr = choice
   [ whileNotAtom $ parseHashPrefix
   , whileNotAtom $ parseComplex defaultReal
   , whileNotAtom $ parseInfNan  defaultReal
-  , String <$> parseString
   , Atom   <$> parseAtom
+  , String <$> parseString
+  , parseQuoted
+  , parseQuasiquoted
+  , parseUnquoted
+  , parseList
   ]
   where
     defaultReal = double
@@ -243,15 +305,20 @@ parseExpr = choice
 withRem :: MonadParsec e s m => m a -> m (a, s)
 withRem parser = (,) <$> parser <*> getInput
 
-readExpr :: String -> String
+readExpr :: String -> LispVal
 readExpr input =
-  case runIdentity (runParserT (withRem @Void parseExpr) "lisp" input) of
-    Left err  -> "No match in "  ++ errorBundlePretty err
-    Right val -> "Found value: " ++ show val
+  case runIdentity (runParserT (parseExpr <* (sc >> eof)) "lisp" input) of
+    Left  err -> String $ "No match in "  ++ errorBundlePretty err
+    Right val -> val
+
+eval :: LispVal -> LispVal
+eval (List [Atom "quote", val]) = val
+eval val = val
 
 main :: IO ()
 main = do
-  (expr:_) <- getArgs
-  putStrLn $ readExpr expr
+  val <- readExpr <$> (putStr "> " >> getLine)
+  let val' = eval val
+  print $ PrettyLispVal val'
 
 -- main = undefined
