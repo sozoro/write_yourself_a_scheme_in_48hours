@@ -36,6 +36,8 @@ executable myscheme
     build-depends:    base ^>=4.15.1.0,
                       parsec,
                       mtl,
+                      containers,
+                      unordered-containers,
                       parser-combinators,
                       megaparsec
     hs-source-dirs:   app

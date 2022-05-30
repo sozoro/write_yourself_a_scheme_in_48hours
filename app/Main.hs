@@ -1,6 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 -- {-# LANGUAGE BlockArguments #-}
--- {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE DataKinds #-}
@@ -9,21 +9,24 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ConstraintKinds #-}
 
 module Main where
 
 import Control.Applicative (Alternative,(<|>),empty)
 -- import Control.Arrow (first,second)
-import Control.Monad (MonadPlus,mzero,mplus)
--- import Control.Monad.Except
+import Control.Monad -- (MonadPlus,mzero,mplus)
+import qualified Control.Monad.Except as E
 import Control.Monad.IO.Class (MonadIO,liftIO)
 import Control.Monad.Trans
-import Control.Monad.State.Strict (StateT,evalStateT,modify,get)
+import Control.Monad.State.Strict -- (StateT,evalStateT,modify,get,MonadState)
 import Data.Bifunctor (first,second)
 import Data.Complex
 import Data.Functor (void)
 import Data.Functor.Identity
-import qualified Data.List.NonEmpty as NE
+import qualified Data.HashMap.Strict as HM
+import qualified Data.Map.Strict     as Map
+import qualified Data.List.NonEmpty  as NE
 import Data.Maybe (listToMaybe)
 import Data.Void (Void)
 import Data.Ratio (Ratio,(%),numerator,denominator)
@@ -181,7 +184,7 @@ atomTailChar :: Parser Char
 atomTailChar = alphaNumChar <|> lispSymbolChar
 
 parseString :: Parser String
-parseString = char '\"' *> manyTill L.charLiteral (char '\"')
+parseString = single '\"' *> manyTill L.charLiteral (single '\"')
 
 parseAtomTail :: Parser String
 parseAtomTail = many atomTailChar
@@ -191,8 +194,8 @@ parseAtom = letterChar <|> lispSymbolChar >>= \he -> (he :) <$> parseAtomTail
 
 parseHashPrefix :: Parser LispVal
 parseHashPrefix = do
-  char '#'
-  choice $ (\(c, m) -> char c >> m) <$>
+  single '#'
+  choice $ (\(c, m) -> single c >> m) <$>
     [ ('t' , return $ Bool True)
     , ('f' , return $ Bool False)
     , ('b' , integer  <$> signed L.binary)
@@ -209,8 +212,8 @@ appendToState a = modify $ (<> a) -- lazy
 
 signedDigitsString :: Parser String
 signedDigitsString = do
-  sign <- Just <$> char '-' <|> return Nothing
-  void (char '+') <|> return ()
+  sign <- Just <$> single '-' <|> return Nothing
+  void (single '+') <|> return ()
   maybe id (:) sign <$> some digitChar
 
 parseExponentPart :: (Fractional r, Read r) => (r -> LispVal) -> PendingParser LispVal
@@ -227,7 +230,7 @@ parseExponentPart defaultReal = do
 parseFractional :: (Fractional r, Read r) => (r -> LispVal) -> PendingParser LispVal
 parseFractional defaultReal = parseExponentPart defaultReal
   <|> do
-      lift $ char '.'
+      lift $ single '.'
       fractionalPart <- lift $ some digitChar
       appendToState $ '.' : fractionalPart
       fractional <- get
@@ -235,7 +238,7 @@ parseFractional defaultReal = parseExponentPart defaultReal
 
 parseRational :: PendingParser LispVal
 parseRational = do
-  lift $ char '/'
+  lift $ single '/'
   denominator <- lift $ some digitChar
   appendToState $ '%' : denominator
   ratio <- get
@@ -254,7 +257,7 @@ parseReal defaultReal = signedDigitsString >>= \signedDigits ->
 parseComplex :: (Fractional r, Read r) => (r -> LispVal) -> Parser LispVal
 parseComplex defaultReal = parseReal defaultReal >>= \real -> do
       imag <- parseReal defaultReal
-      char 'i'
+      single 'i'
       maybe empty return $ do
         r <- maybeReal real
         i <- maybeReal imag
@@ -263,17 +266,17 @@ parseComplex defaultReal = parseReal defaultReal >>= \real -> do
 
 parseInfNan :: (Fractional r, Read r) => (r -> LispVal) -> Parser LispVal
 parseInfNan defaultReal = defaultReal <$> choice
-  [ string "+inf.0" >> return ( 1 / 0)
-  , string "-inf.0" >> return (-1 / 0)
-  , string "+nan.0" >> return ( 0 / 0)
+  [ chunk "+inf.0" >> return ( 1 / 0)
+  , chunk "-inf.0" >> return (-1 / 0)
+  , chunk "+nan.0" >> return ( 0 / 0)
   ]
 
 whileNotAtom :: Parser a -> Parser a
 whileNotAtom parser = try $ parser <* notFollowedBy atomTailChar
 
 parseList :: Parser LispVal
-parseList = between (symbol "(") (char ')') $ sepEndBy parseExpr space1 >>= \head -> do
-      char '.' >> space1
+parseList = between (symbol "(") (single ')') $ sepEndBy parseExpr space1 >>= \head -> do
+      single '.' >> space1
       tail <- parseExpr
       return (DottedList head tail)
   <|> return (List head)
@@ -282,14 +285,14 @@ appFuncToParsedExpr :: String -> Parser LispVal
 appFuncToParsedExpr f = List . (Atom f :) . pure <$> parseExpr
 
 parseQuoted :: Parser LispVal
-parseQuoted = char '\'' >> appFuncToParsedExpr "quote"
+parseQuoted = single '\'' >> appFuncToParsedExpr "quote"
 
 parseQuasiquoted :: Parser LispVal
-parseQuasiquoted = char '`' >> appFuncToParsedExpr "quasiquote"
+parseQuasiquoted = single '`' >> appFuncToParsedExpr "quasiquote"
 
 parseUnquoted :: Parser LispVal
-parseUnquoted = char ',' >> do
-      char '@' >> appFuncToParsedExpr "unquote-splicing"
+parseUnquoted = single ',' >> do
+      single '@' >> appFuncToParsedExpr "unquote-splicing"
   <|> appFuncToParsedExpr "unquote"
 
 parseExpr :: Parser LispVal
@@ -330,28 +333,55 @@ instance Show LispError where
                                     ++ ", but found arg: " ++ show (PrettyLispVal fnd)
   show (Parser parserErr)            = "Parse error:\n" ++ errorBundlePretty parserErr
 
-type LispErrOrVal = Either LispError LispVal
+type WithLispErr a = Either LispError a
+type LispErrOrVal  = WithLispErr LispVal
 
-readExpr :: String -> LispErrOrVal
-readExpr input =
-  first Parser $ runIdentity $ runParserT (parseExpr <* (sc >> eof)) "" input
+readExpr :: E.MonadError LispError m => String -> m LispVal
+readExpr input = either (E.throwError . Parser) return
+               $ runParser (parseExpr <* (sc >> eof)) "" input
 
-eval :: LispErrOrVal -> LispErrOrVal
-eval ev = ev >>= eval'
-  where
-    eval' :: LispVal -> LispErrOrVal
-    eval' (List [Atom "quote"     , val]) = return val
-    eval' (List [Atom "quasiquote", val]) = return val
-    eval' (List (Atom func : args))       = traverse eval' args >>= apply func
-    eval' (Atom name)                     = return $ String $ "Atom: " ++ name
-    eval' val                             = return val
+type LispEnv = HM.HashMap String LispVal
 
-apply :: String -> [LispVal] -> LispErrOrVal
-apply func args = maybe (Left $ NotFunction "Unrecognized primitive function " func)
-                        ($ args)
-                        $ lookup func primitives
+isBound :: MonadState LispEnv m => String -> m Bool
+isBound var = HM.member var <$> get
 
-primitives :: [(String, [LispVal] -> LispErrOrVal)]
+getVar :: (E.MonadError LispError m, MonadState LispEnv m)
+       => String -> m LispVal
+getVar var = HM.lookup var <$> get >>=
+               maybe (E.throwError $ UnboundVar "Getting an unbound variable" var) return
+
+setVar :: (E.MonadError LispError m, MonadState LispEnv m)
+       => String -> LispVal -> m LispVal
+setVar var val = do
+  env <- get
+  if HM.member var env then put (HM.insert var val env) >> return val
+                       else E.throwError $ UnboundVar "Setting an unbound variable" var
+
+defineVar :: MonadState LispEnv m => String -> LispVal -> m LispVal
+defineVar var val = modify (HM.insert var val) >> return val
+
+bindVars :: MonadState LispEnv m => [(String, LispVal)] -> m ()
+bindVars ls = modify (HM.union $ HM.fromList ls)
+
+eval :: (E.MonadError LispError m, MonadState LispEnv m) => LispVal -> m LispVal
+eval (Atom var)                            = getVar var
+eval (List [Atom "quote"     , val])       = return val
+eval (List [Atom "quasiquote", val])       = return val
+eval (List [Atom "set!"  , Atom var, val]) = eval val >>= setVar    var
+eval (List [Atom "define", Atom var, val]) = eval val >>= defineVar var
+eval (List [Atom "if", pred, conseq, alt]) = eval pred >>= \case
+                                               Bool False -> eval alt
+                                               _          -> eval conseq
+eval (List (Atom func : args))             = traverse eval args >>= apply func
+eval val                                   = return val
+
+apply :: E.MonadError LispError m => String -> [LispVal] -> m LispVal
+apply func args =
+  maybe (E.throwError $ NotFunction "Unrecognized primitive function " func)
+        ($ args)
+        $ lookup func primitives
+
+primitives :: E.MonadError LispError m => [(String, [LispVal] -> m LispVal)]
 primitives = (\(name, func) -> (name, func name)) <$>
   [ ("boolean?"      , isLispBool)
   , ("string?"       , isLispString)
@@ -364,71 +394,71 @@ primitives = (\(name, func) -> (name, func name)) <$>
   , ("symbol->string", symbol2String)
   , ("string->symbol", string2Symbol)
   , ("+"             , realBinOp (+) 0)
-  , ("-"             , realBinOp (-) 0)
+  , ("-"             , realBinOp (-) 0) -- TODO: broken
   , ("*"             , realBinOp (*) 1)
   ]
 
-type LispFunction = String -> [LispVal] -> LispErrOrVal
+type LispFunction = forall m. E.MonadError LispError m => String -> [LispVal] -> m LispVal
 
 isLispBool :: LispFunction
-isLispBool _    [Bool _] = return $ Bool True
-isLispBool _    [_]      = return $ Bool False
-isLispBool name args     = Left   $ NumArgs name 1 args
+isLispBool _    [Bool _] = return       $ Bool True
+isLispBool _    [_]      = return       $ Bool False
+isLispBool name args     = E.throwError $ NumArgs name 1 args
 
 isLispString :: LispFunction
-isLispString _    [String _] = return $ Bool True
-isLispString _    [_]        = return $ Bool False
-isLispString name args       = Left   $ NumArgs name 1 args
+isLispString _    [String _] = return       $ Bool True
+isLispString _    [_]        = return       $ Bool False
+isLispString name args       = E.throwError $ NumArgs name 1 args
 
 isLispCharacter :: LispFunction
-isLispCharacter _    [Character _] = return $ Bool True
-isLispCharacter _    [_]           = return $ Bool False
-isLispCharacter name args          = Left   $ NumArgs name 1 args
+isLispCharacter _    [Character _] = return       $ Bool True
+isLispCharacter _    [_]           = return       $ Bool False
+isLispCharacter name args          = E.throwError $ NumArgs name 1 args
 
 isLispList :: LispFunction
-isLispList _    [List _] = return $ Bool True
-isLispList _    [_]      = return $ Bool False
-isLispList name args     = Left   $ NumArgs name 1 args
+isLispList _    [List _] = return       $ Bool True
+isLispList _    [_]      = return       $ Bool False
+isLispList name args     = E.throwError $ NumArgs name 1 args
 
 isLispDottedList :: LispFunction
-isLispDottedList _    [DottedList _ _] = return $ Bool True
-isLispDottedList _    [_]              = return $ Bool False
-isLispDottedList name args             = Left   $ NumArgs name 1 args
+isLispDottedList _    [DottedList _ _] = return       $ Bool True
+isLispDottedList _    [_]              = return       $ Bool False
+isLispDottedList name args             = E.throwError $ NumArgs name 1 args
 
 isLispSymbol :: LispFunction
-isLispSymbol _    [Atom _] = return $ Bool True
-isLispSymbol _    [_]      = return $ Bool False
-isLispSymbol name args     = Left   $ NumArgs name 1 args
+isLispSymbol _    [Atom _] = return       $ Bool True
+isLispSymbol _    [_]      = return       $ Bool False
+isLispSymbol name args     = E.throwError $ NumArgs name 1 args
 
 notLispBool :: LispFunction
-notLispBool _    [Bool True ] = return $ Bool False
-notLispBool _    [Bool False] = return $ Bool True
-notLispBool name [_]          = return $ Bool False
-notLispBool name args         = Left   $ NumArgs name 1 args
+notLispBool _    [Bool True ] = return       $ Bool False
+notLispBool _    [Bool False] = return       $ Bool True
+notLispBool name [_]          = return       $ Bool False
+notLispBool name args         = E.throwError $ NumArgs name 1 args
 
 isNullLispList :: LispFunction
-isNullLispList _    [List []] = return $ Bool True
-isNullLispList name [_]       = return $ Bool False
-isNullLispList name args      = Left   $ NumArgs name 1 args
+isNullLispList _    [List []] = return       $ Bool True
+isNullLispList name [_]       = return       $ Bool False
+isNullLispList name args      = E.throwError $ NumArgs name 1 args
 
 symbol2String :: LispFunction
-symbol2String _    [Atom name] = return $ String name
-symbol2String name [arg]       = Left   $ TypeMismatch name "symbol" arg
-symbol2String name args        = Left   $ NumArgs name 1 args
+symbol2String _    [Atom name] = return       $ String name
+symbol2String name [arg]       = E.throwError $ TypeMismatch name "symbol" arg
+symbol2String name args        = E.throwError $ NumArgs name 1 args
 
 string2Symbol :: LispFunction
-string2Symbol _    [String str] = return $ Atom str
-string2Symbol name [arg]        = Left   $ TypeMismatch name "string" arg
-string2Symbol name args         = Left   $ NumArgs name 1 args
+string2Symbol _    [String str] = return       $ Atom str
+string2Symbol name [arg]        = E.throwError $ TypeMismatch name "string" arg
+string2Symbol name args         = E.throwError $ NumArgs name 1 args
 
 realBinOp :: forall rc. (forall a. Num a => a -> a -> a) -> Integer -> LispFunction
 realBinOp op init name args =
   Real . foldl (binOpNumR $ \x y -> CBReal $ x `op` y) (Integer $ CBReal init)
   <$> traverse (unpackReal name) args
 
-unpackReal :: String -> LispVal -> Either LispError (Number 'R)
+unpackReal :: E.MonadError LispError m => String -> LispVal -> m (Number 'R)
 unpackReal _    (Real r) = return r
-unpackReal func arg      = Left $ TypeMismatch func "real number" arg
+unpackReal func arg      = E.throwError $ TypeMismatch func "real number" arg
 {- Dynamic
 unpackReal (String str)  = either (const $ Integer $ CBReal 0) unpackReal $ readExpr str
 unpackReal (Character c) = either (const $ Integer $ CBReal 0) unpackReal $ readExpr [c]
@@ -439,18 +469,22 @@ unpackReal _             = Integer $ CBReal 0
 printLispErrOrVal :: LispErrOrVal -> IO ()
 printLispErrOrVal = putStrLn . either show (show . PrettyLispVal)
 
-repl :: IO ()
+prompt :: String -> IO String
+prompt prmpt = putStr prmpt >> hFlush stdout >> getLine
+
+rep :: String -> StateT LispEnv IO ()
+rep expr = do
+  errOrVal <- E.runExceptT $ do
+    val <- readExpr expr
+    eval val
+  liftIO $ printLispErrOrVal errOrVal
+
+repl :: StateT LispEnv IO ()
 repl = do
-  putStrLn "~~~ Scheme REPL ~~~"
-  loop
-  where
-    loop = do
-      val  <- readExpr          <$> (putStr "> " >> hFlush stdout >> getLine)
-      val' <- eval              <$> return val
-      _    <- printLispErrOrVal  $  val'
-      loop
+  liftIO $ putStrLn "~~~ Scheme REPL ~~~"
+  forever $ liftIO (prompt "> ") >>= rep
 
 main :: IO ()
-main = listToMaybe <$> getArgs >>= maybe repl (printLispErrOrVal . eval . readExpr)
+main = listToMaybe <$> getArgs >>= flip evalStateT mempty . maybe repl rep
 
 -- main = undefined
