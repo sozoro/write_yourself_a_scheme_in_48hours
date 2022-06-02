@@ -9,7 +9,7 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE ConstraintKinds #-}
+-- {-# LANGUAGE ConstraintKinds #-}
 
 module Main where
 
@@ -22,14 +22,16 @@ import Control.Monad.Trans
 import Control.Monad.State.Strict -- (StateT,evalStateT,modify,get,MonadState)
 import Data.Bifunctor (first,second)
 import Data.Complex
+import Data.Either (isLeft)
 import Data.Functor (void)
 import Data.Functor.Identity
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Map.Strict     as Map
 import qualified Data.List.NonEmpty  as NE
-import Data.Maybe (listToMaybe)
+import Data.Maybe (listToMaybe,fromMaybe)
 import Data.Void (Void)
 import Data.Ratio (Ratio,(%),numerator,denominator)
+import qualified Debug.Trace as T
 import System.Environment (getArgs)
 import System.IO (hFlush,stdout)
 
@@ -103,33 +105,59 @@ binOpNumC op a b = match (upcast upper a) (upcast upper b)
     match (Double   (CBComp x)) (Double   (CBComp y)) = Double   $ x `op` y
     match _ _ = error "binOpNumR: match: upcast is broken"
 
-data LispVal = Atom       String
-             | List       [LispVal]
-             | DottedList [LispVal] LispVal
-             | Real       (Number 'R)
-             | Complex    (Number 'C)
-             | Character  Char
-             | String     String
-             | Bool       Bool
-             deriving (Show,Eq)
+newtype Primitive = Primitive
+  { appPrim :: forall m. E.MonadError LispError m => [LispVal] -> m LispVal }
 
-newtype PrettyLispVal = PrettyLispVal { unPrettyLispVal :: LispVal } deriving Eq
+instance Show Primitive where
+  show (Primitive _) = "<primitive>"
+
+data LispVal = Atom          String
+             | List          [LispVal]
+             | DottedList    [LispVal] LispVal
+             | Real          (Number 'R)
+             | Complex       (Number 'C)
+             | Character     Char
+             | String        String
+             | Bool          Bool
+             | PrimitiveFunc Primitive
+             | Func { params    :: [String]
+                    , listParam :: Maybe String
+                    , body      :: NE.NonEmpty LispVal
+                    , closure   :: LispEnv
+                    }
+             deriving Show
+
+newtype PrettyLispVal = PrettyLispVal { unPrettyLispVal :: LispVal }
 
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . fmap (show . PrettyLispVal)
+
+unpackPrimitiveFunc :: LispVal -> Either LispVal Primitive
+unpackPrimitiveFunc (PrimitiveFunc prim) = return prim
+unpackPrimitiveFunc val                  = Left   val
+
+withoutPrimitive :: LispEnv -> LispEnv
+withoutPrimitive = HM.filter (isLeft . unpackPrimitiveFunc)
+
+showLispEnv :: LispEnv -> String
+showLispEnv = show . fmap PrettyLispVal . withoutPrimitive
 
 instance Show PrettyLispVal where
   show = showVal . unPrettyLispVal
     where
       showVal :: LispVal -> String
-      showVal (Atom       name)  = name
-      showVal (String     str)   = "\"" ++ str ++ "\""
-      showVal (Real       r)     = showReal r
-      showVal (Complex    c)     = show c -- TODO
-      showVal (Bool       True)  = "#t"
-      showVal (Bool       False) = "#f"
-      showVal (List       ls)    = "(" ++ unwordsList ls ++ ")"
-      showVal (DottedList hd tl) = "(" ++ unwordsList hd ++ " . " ++ showVal tl ++ ")"
+      showVal (Atom       name)    = name
+      showVal (String     str)     = "\"" ++ str ++ "\""
+      showVal (Real       r)       = showReal r
+      showVal (Complex    c)       = show c -- TODO
+      showVal (Bool       True)    = "#t"
+      showVal (Bool       False)   = "#f"
+      showVal (List       ls)      = "(" ++ unwordsList ls ++ ")"
+      showVal (DottedList hd tl)   = "(" ++ unwordsList hd ++ " . " ++ showVal tl ++ ")"
+      showVal (PrimitiveFunc prim) = show prim
+      showVal (Func ps lp bd clsr) = "(lambda (" ++ unwords (show <$> ps)
+                                  ++ maybe "" (" . " ++) lp ++ ") ...) "
+                                  ++ show (PrettyLispVal <$> withoutPrimitive clsr)
 
       showReal :: Number 'R -> String
       showReal (Integer  (CBReal i)) = show i
@@ -313,25 +341,32 @@ parseExpr = choice
 withRem :: MonadParsec e s m => m a -> m (a, s)
 withRem parser = (,) <$> parser <*> getInput
 
-data LispError = NumArgs String Integer [LispVal]
+data LispError = NumArgs (Maybe String) Integer [LispVal]
                | TypeMismatch String String LispVal
                | Parser ParserError
                | BadSpecialForm String LispVal
                | NotFunction String String
                | UnboundVar String String
                | Default String
+               | NonSymbolParam (Maybe String) LispVal
+
+funcName :: Maybe String -> String
+funcName = maybe "" (\func -> show func ++ " ")
 
 instance Show LispError where
   show (UnboundVar message varname)  = message ++ ": " ++ varname
   show (BadSpecialForm message form) = message ++ ": " ++ show (PrettyLispVal form)
   show (NotFunction message func)    = message ++ ": " ++ show func
-  show (NumArgs func expected found) = "Function "               ++ show func
-                                    ++ " expects "               ++ show expected
+  show (NumArgs func expected found) = "Function " ++ funcName func
+                                    ++ "expects " ++ show expected
                                     ++ " args; but applied to: " ++ unwordsList found
   show (TypeMismatch fnc expctd fnd) = "Invalid type in "  ++ show fnc
                                     ++ "; expected "       ++ expctd
                                     ++ ", but found arg: " ++ show (PrettyLispVal fnd)
   show (Parser parserErr)            = "Parse error:\n" ++ errorBundlePretty parserErr
+  show (NonSymbolParam func param)   = "Defining function " ++ funcName func
+                                    ++ "with non symbol parameter: " ++ show param
+  show (Default message)             = message
 
 type WithLispErr a = Either LispError a
 type LispErrOrVal  = WithLispErr LispVal
@@ -360,8 +395,29 @@ setVar var val = do
 defineVar :: MonadState LispEnv m => String -> LispVal -> m LispVal
 defineVar var val = modify (HM.insert var val) >> return val
 
-bindVars :: MonadState LispEnv m => [(String, LispVal)] -> m ()
-bindVars ls = modify (HM.union $ HM.fromList ls)
+bindVars :: MonadState LispEnv m => LispEnv -> m ()
+-- bindVars closure = modify $ \env -> HM.unionWith (\v _ -> v) env closure
+bindVars closure = modify $ \env -> HM.unionWith (\_ v -> v) env closure
+-- bindVars ls = modify $ \orig ->
+--                 foldr (\(k,v) hm -> HM.alter (Just . fromMaybe v) k hm) orig ls
+
+unpackAtom :: LispVal -> Either LispVal String
+unpackAtom (Atom atom) = return atom
+unpackAtom val         = Left   val
+
+makeFunc :: (E.MonadError LispError m, MonadState LispEnv m)
+         => Maybe String -> [LispVal] -> Maybe LispVal -> NE.NonEmpty LispVal
+         -> m LispVal
+makeFunc mVar paramVals mListParamVal body = do
+  params     <- unpackParams paramVals
+  mListParam <- unpackParams mListParamVal
+  closure    <- get
+  return $ Func params mListParam body closure
+  where
+    unpackParams :: (E.MonadError LispError m, Traversable t)
+                 => t LispVal -> m (t String)
+    unpackParams paramVals = either (E.throwError . NonSymbolParam mVar) return
+                           $ traverse unpackAtom paramVals
 
 eval :: (E.MonadError LispError m, MonadState LispEnv m) => LispVal -> m LispVal
 eval (Atom var)                            = getVar var
@@ -372,16 +428,71 @@ eval (List [Atom "define", Atom var, val]) = eval val >>= defineVar var
 eval (List [Atom "if", pred, conseq, alt]) = eval pred >>= \case
                                                Bool False -> eval alt
                                                _          -> eval conseq
-eval (List (Atom func : args))             = traverse eval args >>= apply func
+eval (List (Atom "define" : List         (Atom var : pVals)     : bodyHd : bodyTl)) =
+  makeFunc (Just var) pVals Nothing      (bodyHd NE.:| bodyTl) >>= defineVar var
+eval (List (Atom "define" : DottedList (Atom var : pVals) lpVal : bodyHd : bodyTl)) =
+  makeFunc (Just var) pVals (Just lpVal) (bodyHd NE.:| bodyTl) >>= defineVar var
+eval (List (Atom "lambda" : List       pVals       : bodyHd : bodyTl)) =
+  makeFunc Nothing    pVals Nothing      (bodyHd NE.:| bodyTl)
+eval (List (Atom "lambda" : DottedList pVals lpVal : bodyHd : bodyTl)) =
+  makeFunc Nothing    pVals (Just lpVal) (bodyHd NE.:| bodyTl)
+eval (List (Atom "lambda" : lpVal@(Atom _)         : bodyHd : bodyTl)) =
+  makeFunc Nothing    []    (Just lpVal) (bodyHd NE.:| bodyTl)
+eval (List (function : args))              = do
+                                               func    <- eval function
+                                               argVals <- traverse eval args
+                                               func `apply` argVals
 eval val                                   = return val
 
-apply :: E.MonadError LispError m => String -> [LispVal] -> m LispVal
-apply func args =
-  maybe (E.throwError $ NotFunction "Unrecognized primitive function " func)
-        ($ args)
-        $ lookup func primitives
+-- return remaining list
+zipWith' :: (a -> b -> c) -> [a] -> [b] -> ([c], Either [a] [b])
+zipWith' _ [] bs         = ([], Right bs)
+zipWith' _ as []         = ([], Left  as)
+zipWith' f (a:as) (b:bs) = first (f a b :) $ zipWith' f as bs
 
-primitives :: E.MonadError LispError m => [(String, [LispVal] -> m LispVal)]
+zip' :: [a] -> [b] -> ([(a, b)], Either [a] [b])
+zip' = zipWith' (,)
+
+onException :: E.MonadError e m => m a -> m b -> m a
+onException ma what = ma `E.catchError` \e -> what >> E.throwError e
+
+finally :: E.MonadError e m => m a -> m b -> m a
+finally ma sequel = (ma `onException` sequel) <* sequel
+
+-- withTmpState :: (E.MonadError e m, MonadState s m) => s -> m a -> m a
+-- withTmpState s ma = do
+--   orig <- get
+--   put s
+--   ma `finally` put orig
+
+apply :: (E.MonadError LispError m, MonadState LispEnv m)
+      => LispVal -> [LispVal] -> m LispVal
+apply (PrimitiveFunc prim) args = prim `appPrim` args
+apply (Func ps lp bd clsr) args = do
+  let numArgsErr = E.throwError $ NumArgs Nothing (toInteger $ length ps) args
+  varArgs <- case zip' ps args of
+               (_  , Left   _)            -> numArgsErr
+               (pas, Right listArg@[])    -> maybe (return pas)
+                 (\listParam -> return $ (listParam, List listArg) : pas) lp
+               (pas, Right listArg@(_:_)) -> maybe numArgsErr
+                 (\listParam -> return $ (listParam, List listArg) : pas) lp
+  (val, clsr') <- flip runStateT clsr $ do
+    bindVars $ HM.fromList varArgs
+    NE.last <$> traverse eval bd
+  return val
+  -- modify (HM.union clsr)
+  -- get >>= T.traceM . ("before bindClosure: " ++) . showLispEnv
+  -- bindVars clsr
+  -- get >>= T.traceM . ("after bindClosure : " ++) . showLispEnv
+  -- bindVars $ HM.fromList varArgs
+  -- get >>= T.traceM . ("after bindVars    : " ++) . showLispEnv
+  -- NE.last <$> traverse eval bd
+  --
+  -- withTmpState clsr $ do
+  --   bindVars varArgs
+  --   NE.last <$> traverse eval bd
+
+primitives :: [(String, Primitive)]
 primitives = (\(name, func) -> (name, func name)) <$>
   [ ("boolean?"      , isLispBool)
   , ("string?"       , isLispString)
@@ -398,61 +509,70 @@ primitives = (\(name, func) -> (name, func name)) <$>
   , ("*"             , realBinOp (*) 1)
   ]
 
-type LispFunction = forall m. E.MonadError LispError m => String -> [LispVal] -> m LispVal
+isLispBool :: String -> Primitive
+isLispBool name = Primitive $ \case
+  [Bool _] -> return       $ Bool True
+  [_]      -> return       $ Bool False
+  args     -> E.throwError $ NumArgs (Just name) 1 args
 
-isLispBool :: LispFunction
-isLispBool _    [Bool _] = return       $ Bool True
-isLispBool _    [_]      = return       $ Bool False
-isLispBool name args     = E.throwError $ NumArgs name 1 args
+isLispString :: String -> Primitive
+isLispString name = Primitive $ \case
+  [String _] -> return       $ Bool True
+  [_]        -> return       $ Bool False
+  args       -> E.throwError $ NumArgs (Just name) 1 args
 
-isLispString :: LispFunction
-isLispString _    [String _] = return       $ Bool True
-isLispString _    [_]        = return       $ Bool False
-isLispString name args       = E.throwError $ NumArgs name 1 args
+isLispCharacter :: String -> Primitive
+isLispCharacter name = Primitive $ \case
+  [Character _] -> return       $ Bool True
+  [_]           -> return       $ Bool False
+  args          -> E.throwError $ NumArgs (Just name) 1 args
 
-isLispCharacter :: LispFunction
-isLispCharacter _    [Character _] = return       $ Bool True
-isLispCharacter _    [_]           = return       $ Bool False
-isLispCharacter name args          = E.throwError $ NumArgs name 1 args
+isLispList :: String -> Primitive
+isLispList name = Primitive $ \case
+  [List _] -> return       $ Bool True
+  [_]      -> return       $ Bool False
+  args     -> E.throwError $ NumArgs (Just name) 1 args
 
-isLispList :: LispFunction
-isLispList _    [List _] = return       $ Bool True
-isLispList _    [_]      = return       $ Bool False
-isLispList name args     = E.throwError $ NumArgs name 1 args
+isLispDottedList :: String -> Primitive
+isLispDottedList name = Primitive $ \case
+  [DottedList _ _] -> return       $ Bool True
+  [_]              -> return       $ Bool False
+  args             -> E.throwError $ NumArgs (Just name) 1 args
 
-isLispDottedList :: LispFunction
-isLispDottedList _    [DottedList _ _] = return       $ Bool True
-isLispDottedList _    [_]              = return       $ Bool False
-isLispDottedList name args             = E.throwError $ NumArgs name 1 args
+isLispSymbol :: String -> Primitive
+isLispSymbol name = Primitive $ \case
+  [Atom _] -> return       $ Bool True
+  [_]      -> return       $ Bool False
+  args     -> E.throwError $ NumArgs (Just name) 1 args
 
-isLispSymbol :: LispFunction
-isLispSymbol _    [Atom _] = return       $ Bool True
-isLispSymbol _    [_]      = return       $ Bool False
-isLispSymbol name args     = E.throwError $ NumArgs name 1 args
+notLispBool :: String -> Primitive
+notLispBool name = Primitive $ \case
+  [Bool True ] -> return       $ Bool False
+  [Bool False] -> return       $ Bool True
+  [_]          -> return       $ Bool False
+  args         -> E.throwError $ NumArgs (Just name) 1 args
 
-notLispBool :: LispFunction
-notLispBool _    [Bool True ] = return       $ Bool False
-notLispBool _    [Bool False] = return       $ Bool True
-notLispBool name [_]          = return       $ Bool False
-notLispBool name args         = E.throwError $ NumArgs name 1 args
+isNullLispList :: String -> Primitive
+isNullLispList name = Primitive $ \case
+  [List []] -> return       $ Bool True
+  [_]       -> return       $ Bool False
+  args      -> E.throwError $ NumArgs (Just name) 1 args
 
-isNullLispList :: LispFunction
-isNullLispList _    [List []] = return       $ Bool True
-isNullLispList name [_]       = return       $ Bool False
-isNullLispList name args      = E.throwError $ NumArgs name 1 args
+symbol2String :: String -> Primitive
+symbol2String name = Primitive $ \case
+  [Atom name] -> return       $ String name
+  [arg]       -> E.throwError $ TypeMismatch name "symbol" arg
+  args        -> E.throwError $ NumArgs (Just name) 1 args
 
-symbol2String :: LispFunction
-symbol2String _    [Atom name] = return       $ String name
-symbol2String name [arg]       = E.throwError $ TypeMismatch name "symbol" arg
-symbol2String name args        = E.throwError $ NumArgs name 1 args
+string2Symbol :: String -> Primitive
+string2Symbol name = Primitive $ \case
+  [String str] -> return       $ Atom str
+  [arg]        -> E.throwError $ TypeMismatch name "string" arg
+  args         -> E.throwError $ NumArgs (Just name) 1 args
 
-string2Symbol :: LispFunction
-string2Symbol _    [String str] = return       $ Atom str
-string2Symbol name [arg]        = E.throwError $ TypeMismatch name "string" arg
-string2Symbol name args         = E.throwError $ NumArgs name 1 args
-
-realBinOp :: forall rc. (forall a. Num a => a -> a -> a) -> Integer -> LispFunction
-realBinOp op init name args =
+realBinOp :: forall rc. (forall a. Num a => a -> a -> a) -> Integer
+          -> String -> Primitive
+realBinOp op init name = Primitive $ \args ->
   Real . foldl (binOpNumR $ \x y -> CBReal $ x `op` y) (Integer $ CBReal init)
   <$> traverse (unpackReal name) args
 
@@ -485,6 +605,8 @@ repl = do
   forever $ liftIO (prompt "> ") >>= rep
 
 main :: IO ()
-main = listToMaybe <$> getArgs >>= flip evalStateT mempty . maybe repl rep
+main = listToMaybe <$> getArgs >>= flip evalStateT env . maybe repl rep
+  where
+    env = HM.fromList $ second PrimitiveFunc <$> primitives
 
 -- main = undefined
