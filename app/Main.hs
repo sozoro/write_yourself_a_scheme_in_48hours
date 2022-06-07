@@ -9,7 +9,7 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
--- {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE ConstraintKinds #-}
 
 module Main where
 
@@ -19,12 +19,14 @@ import Control.Monad -- (MonadPlus,mzero,mplus)
 import qualified Control.Monad.Except as E
 import Control.Monad.IO.Class (MonadIO,liftIO)
 import Control.Monad.Trans
+import Control.Monad.Reader -- (MonadReader,ask)
 import Control.Monad.State.Strict -- (StateT,evalStateT,modify,get,MonadState)
 import Data.Bifunctor (first,second)
 import Data.Complex
 import Data.Either (isLeft)
 import Data.Functor (void)
 import Data.Functor.Identity
+import Data.IORef
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Map.Strict     as Map
 import qualified Data.List.NonEmpty  as NE
@@ -123,9 +125,9 @@ data LispVal = Atom          String
              | Func { params    :: [String]
                     , listParam :: Maybe String
                     , body      :: NE.NonEmpty LispVal
-                    , closure   :: LispEnv
+                    , closure   :: IORef LispEnv
                     }
-             deriving Show
+             -- deriving Show -- TODO
 
 newtype PrettyLispVal = PrettyLispVal { unPrettyLispVal :: LispVal }
 
@@ -157,7 +159,8 @@ instance Show PrettyLispVal where
       showVal (PrimitiveFunc prim) = show prim
       showVal (Func ps lp bd clsr) = "(lambda (" ++ unwords (show <$> ps)
                                   ++ maybe "" (" . " ++) lp ++ ") ...) "
-                                  ++ show (PrettyLispVal <$> withoutPrimitive clsr)
+                                  -- ++ show (PrettyLispVal <$> withoutPrimitive clsr)
+                                  -- TODO
 
       showReal :: Number 'R -> String
       showReal (Integer  (CBReal i)) = show i
@@ -365,7 +368,8 @@ instance Show LispError where
                                     ++ ", but found arg: " ++ show (PrettyLispVal fnd)
   show (Parser parserErr)            = "Parse error:\n" ++ errorBundlePretty parserErr
   show (NonSymbolParam func param)   = "Defining function " ++ funcName func
-                                    ++ "with non symbol parameter: " ++ show param
+                                    ++ "with non symbol parameter: "
+                                    ++ show (PrettyLispVal param)
   show (Default message)             = message
 
 type WithLispErr a = Either LispError a
@@ -375,43 +379,54 @@ readExpr :: E.MonadError LispError m => String -> m LispVal
 readExpr input = either (E.throwError . Parser) return
                $ runParser (parseExpr <* (sc >> eof)) "" input
 
-type LispEnv = HM.HashMap String LispVal
+type LispEnv            = HM.HashMap String LispVal
+type MonadWithLispEnv m = (MonadReader (IORef LispEnv) m, MonadIO m)
 
-isBound :: MonadState LispEnv m => String -> m Bool
-isBound var = HM.member var <$> get
+getLispEnv :: MonadWithLispEnv m => m LispEnv
+getLispEnv = ask >>= liftIO . readIORef
 
-getVar :: (E.MonadError LispError m, MonadState LispEnv m)
-       => String -> m LispVal
-getVar var = HM.lookup var <$> get >>=
+putLispEnv :: MonadWithLispEnv m => LispEnv -> m ()
+putLispEnv env = ask >>= liftIO . flip writeIORef env
+
+modifyLispEnv :: MonadWithLispEnv m => (LispEnv -> LispEnv) -> m ()
+modifyLispEnv f = ask >>= liftIO . flip modifyIORef' f
+
+newLispEnv :: MonadWithLispEnv m => LispEnv -> m (IORef LispEnv)
+newLispEnv = liftIO . newIORef
+
+copyLispEnv :: MonadWithLispEnv m => m (IORef LispEnv)
+copyLispEnv = getLispEnv >>= newLispEnv
+
+isBound :: MonadWithLispEnv m => String -> m Bool
+isBound var = HM.member var <$> getLispEnv
+
+getVar :: (E.MonadError LispError m, MonadWithLispEnv m) => String -> m LispVal
+getVar var = HM.lookup var <$> getLispEnv >>=
                maybe (E.throwError $ UnboundVar "Getting an unbound variable" var) return
 
-setVar :: (E.MonadError LispError m, MonadState LispEnv m)
-       => String -> LispVal -> m LispVal
+setVar :: (E.MonadError LispError m, MonadWithLispEnv m) => String -> LispVal -> m LispVal
 setVar var val = do
-  env <- get
-  if HM.member var env then put (HM.insert var val env) >> return val
+  env <- getLispEnv
+  if HM.member var env then putLispEnv (HM.insert var val env) >> return val
                        else E.throwError $ UnboundVar "Setting an unbound variable" var
 
-defineVar :: MonadState LispEnv m => String -> LispVal -> m LispVal
-defineVar var val = modify (HM.insert var val) >> return val
+defineVar :: MonadWithLispEnv m => String -> LispVal -> m LispVal
+defineVar var val = modifyLispEnv (HM.insert var val) >> return val
 
-bindVars :: MonadState LispEnv m => LispEnv -> m ()
--- bindVars closure = modify $ \env -> HM.unionWith (\v _ -> v) env closure
-bindVars closure = modify $ \env -> HM.unionWith (\_ v -> v) env closure
--- bindVars ls = modify $ \orig ->
---                 foldr (\(k,v) hm -> HM.alter (Just . fromMaybe v) k hm) orig ls
+bindVars :: MonadWithLispEnv m => LispEnv -> m ()
+bindVars closure = modifyLispEnv $ \env -> HM.unionWith (flip const) env closure
 
 unpackAtom :: LispVal -> Either LispVal String
 unpackAtom (Atom atom) = return atom
 unpackAtom val         = Left   val
 
-makeFunc :: (E.MonadError LispError m, MonadState LispEnv m)
+makeFunc :: (E.MonadError LispError m, MonadWithLispEnv m)
          => Maybe String -> [LispVal] -> Maybe LispVal -> NE.NonEmpty LispVal
          -> m LispVal
 makeFunc mVar paramVals mListParamVal body = do
   params     <- unpackParams paramVals
   mListParam <- unpackParams mListParamVal
-  closure    <- get
+  closure    <- copyLispEnv
   return $ Func params mListParam body closure
   where
     unpackParams :: (E.MonadError LispError m, Traversable t)
@@ -419,7 +434,7 @@ makeFunc mVar paramVals mListParamVal body = do
     unpackParams paramVals = either (E.throwError . NonSymbolParam mVar) return
                            $ traverse unpackAtom paramVals
 
-eval :: (E.MonadError LispError m, MonadState LispEnv m) => LispVal -> m LispVal
+eval :: (E.MonadError LispError m, MonadWithLispEnv m) => LispVal -> m LispVal
 eval (Atom var)                            = getVar var
 eval (List [Atom "quote"     , val])       = return val
 eval (List [Atom "quasiquote", val])       = return val
@@ -438,11 +453,11 @@ eval (List (Atom "lambda" : DottedList pVals lpVal : bodyHd : bodyTl)) =
   makeFunc Nothing    pVals (Just lpVal) (bodyHd NE.:| bodyTl)
 eval (List (Atom "lambda" : lpVal@(Atom _)         : bodyHd : bodyTl)) =
   makeFunc Nothing    []    (Just lpVal) (bodyHd NE.:| bodyTl)
-eval (List (function : args))              = do
-                                               func    <- eval function
-                                               argVals <- traverse eval args
-                                               func `apply` argVals
-eval val                                   = return val
+eval (List (function : args)) = do
+                                  func    <- eval function
+                                  argVals <- traverse eval args
+                                  func `apply` argVals
+eval val = E.throwError $ BadSpecialForm "Unrecognized special form" val
 
 -- return remaining list
 zipWith' :: (a -> b -> c) -> [a] -> [b] -> ([c], Either [a] [b])
@@ -465,7 +480,7 @@ finally ma sequel = (ma `onException` sequel) <* sequel
 --   put s
 --   ma `finally` put orig
 
-apply :: (E.MonadError LispError m, MonadState LispEnv m)
+apply :: (E.MonadError LispError m, MonadWithLispEnv m)
       => LispVal -> [LispVal] -> m LispVal
 apply (PrimitiveFunc prim) args = prim `appPrim` args
 apply (Func ps lp bd clsr) args = do
@@ -476,7 +491,7 @@ apply (Func ps lp bd clsr) args = do
                  (\listParam -> return $ (listParam, List listArg) : pas) lp
                (pas, Right listArg@(_:_)) -> maybe numArgsErr
                  (\listParam -> return $ (listParam, List listArg) : pas) lp
-  (val, clsr') <- flip runStateT clsr $ do
+  val <- flip runReaderT clsr $ do
     bindVars $ HM.fromList varArgs
     NE.last <$> traverse eval bd
   return val
@@ -592,20 +607,24 @@ printLispErrOrVal = putStrLn . either show (show . PrettyLispVal)
 prompt :: String -> IO String
 prompt prmpt = putStr prmpt >> hFlush stdout >> getLine
 
-rep :: String -> StateT LispEnv IO ()
+type WithLispEnv = ReaderT (IORef LispEnv)
+
+rep :: String -> WithLispEnv IO ()
 rep expr = do
   errOrVal <- E.runExceptT $ do
     val <- readExpr expr
     eval val
   liftIO $ printLispErrOrVal errOrVal
 
-repl :: StateT LispEnv IO ()
+repl :: WithLispEnv IO ()
 repl = do
   liftIO $ putStrLn "~~~ Scheme REPL ~~~"
   forever $ liftIO (prompt "> ") >>= rep
 
 main :: IO ()
-main = listToMaybe <$> getArgs >>= flip evalStateT env . maybe repl rep
+main = do
+  global <- newIORef env
+  listToMaybe <$> getArgs >>= flip runReaderT global . maybe repl rep
   where
     env = HM.fromList $ second PrimitiveFunc <$> primitives
 
