@@ -1,7 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 -- {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE TypeApplications #-}
+-- {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE KindSignatures #-}
@@ -251,7 +251,7 @@ parseHashPrefix = do
 type PendingParser = StateT String Parser
 
 appendToState :: (Monad m, Monoid a) => a -> StateT a m ()
-appendToState a = modify $ (<> a) -- lazy
+appendToState a = modify (<> a) -- lazy
 
 signedDigitsString :: Parser String
 signedDigitsString = do
@@ -262,7 +262,7 @@ signedDigitsString = do
 parseExponentPart :: (Fractional r, Read r) => (r -> LispVal) -> PendingParser LispVal
 parseExponentPart defaultReal = do
   precision     <- lift $ oneOf "fde"
-  exponentPart  <- lift $ signedDigitsString
+  exponentPart  <- lift signedDigitsString
   appendToState $ 'e' : exponentPart
   floatingPoint <- get
   return $ case precision of
@@ -284,15 +284,14 @@ parseRational = do
   lift $ single '/'
   denominator <- lift $ some digitChar
   appendToState $ '%' : denominator
-  ratio <- get
-  return $ rational $ read ratio
+  rational . read <$> get
 
 parseReal :: (Fractional r, Read r) => (r -> LispVal) -> Parser LispVal
 parseReal defaultReal = signedDigitsString >>= \signedDigits ->
   choice $ flip evalStateT signedDigits <$>
     [ parseFractional defaultReal
     , parseRational
-    , get >>= return . integer . read
+    , integer . read <$> get
     ]
 
 -- TODO: parse dot-start fractional ".4e-1"
@@ -320,8 +319,7 @@ whileNotAtom parser = try $ parser <* notFollowedBy atomTailChar
 parseList :: Parser LispVal
 parseList = between (symbol "(") (single ')') $ sepEndBy parseExpr space1 >>= \head -> do
       single '.' >> space1
-      tail <- parseExpr
-      return (DottedList head tail)
+      DottedList head <$> parseExpr
   <|> return (List head)
 
 appFuncToParsedExpr :: String -> Parser LispVal
@@ -340,7 +338,7 @@ parseUnquoted = single ',' >> do
 
 parseExpr :: Parser LispVal
 parseExpr = choice
-  [ whileNotAtom $ parseHashPrefix
+  [ whileNotAtom   parseHashPrefix
   , whileNotAtom $ parseComplex defaultReal
   , whileNotAtom $ parseInfNan  defaultReal
   , Atom   <$> parseAtom
@@ -409,7 +407,7 @@ readExpr :: E.MonadError LispError m => String -> String -> m LispVal
 readExpr file = readOrThrow file $ parseExpr <* (sc >> eof)
 
 readExprList :: E.MonadError LispError m => String -> String -> m [LispVal]
-readExprList file = readOrThrow file $ (endBy parseExpr sc) <* eof
+readExprList file = readOrThrow file $ endBy parseExpr sc <* eof
 
 type LispEnv            = HM.HashMap String LispVal
 type MonadWithLispEnv m = (MonadReader (IORef LispEnv) m, MonadIO m)
@@ -433,8 +431,9 @@ isBound :: MonadWithLispEnv m => String -> m Bool
 isBound var = HM.member var <$> getLispEnv
 
 getVar :: (E.MonadError LispError m, MonadWithLispEnv m) => String -> m LispVal
-getVar var = HM.lookup var <$> getLispEnv >>=
+getVar var = getLispEnv >>=
                maybe (E.throwError $ UnboundVar "Getting an unbound variable" var) return
+               . HM.lookup var
 
 setVar :: (E.MonadError LispError m, MonadWithLispEnv m) => String -> LispVal -> m LispVal
 setVar var val = do
@@ -446,7 +445,7 @@ defineVar :: MonadWithLispEnv m => String -> LispVal -> m LispVal
 defineVar var val = modifyLispEnv (HM.insert var val) >> return val
 
 bindVars :: MonadWithLispEnv m => LispEnv -> m ()
-bindVars closure = modifyLispEnv $ \env -> HM.unionWith (flip const) env closure
+bindVars closure = modifyLispEnv $ \env -> HM.unionWith (\_ v -> v) env closure
 
 unpackAtom :: LispVal -> Either LispVal String
 unpackAtom (Atom atom) = return atom
@@ -458,8 +457,7 @@ makeFunc :: (E.MonadError LispError m, MonadWithLispEnv m)
 makeFunc mVar paramVals mListParamVal body = do
   params     <- unpackParams paramVals
   mListParam <- unpackParams mListParamVal
-  closure    <- copyLispEnv
-  return $ Func params mListParam body closure
+  Func params mListParam body <$> copyLispEnv
   where
     unpackParams :: (E.MonadError LispError m, Traversable t)
                  => t LispVal -> m (t String)
@@ -643,7 +641,7 @@ makePort mode name = IOPrimitive $ \case
 
 closePort :: String -> IOPrimitive
 closePort name = IOPrimitive $ \case
-  [Port port] -> liftIO $ IO.hClose port >> (return $ Bool True)
+  [Port port] -> liftIO $ IO.hClose port >> return (Bool True)
   [arg]       -> E.throwError $ TypeMismatch name "port" arg
   args        -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
@@ -696,14 +694,14 @@ repl = do
 
 runOne :: NE.NonEmpty String -> WithLispEnv IO ()
 runOne (filePath NE.:| args) = do
-  bindVars $ HM.fromList $ [("args", List $ String <$> args)]
+  bindVars $ HM.fromList [("args", List $ String <$> args)]
   errOrVal <- E.runExceptT (eval $ List [Atom "load", String filePath])
   liftIO $ IO.hPutStrLn IO.stderr $ showLispErrOrVal errOrVal
 
 main :: IO ()
 main = do
   global <- newIORef env
-  NE.nonEmpty <$> getArgs >>= flip runReaderT global . maybe repl runOne
+  getArgs >>= flip runReaderT global . maybe repl runOne . NE.nonEmpty
   where
     env = primitives <> ioPrimitives
 
