@@ -35,7 +35,7 @@ import Data.Void (Void)
 import Data.Ratio (Ratio,(%),numerator,denominator)
 import qualified Debug.Trace as T
 import System.Environment (getArgs)
-import System.IO (hFlush,stdout)
+import qualified System.IO   as IO
 
 import           Text.Megaparsec
 import           Text.Megaparsec.Char
@@ -113,6 +113,14 @@ newtype Primitive = Primitive
 instance Show Primitive where
   show (Primitive _) = "<primitive>"
 
+newtype IOPrimitive = IOPrimitive
+  { appIOPrim :: forall m. (E.MonadError LispError m, MonadIO m)
+              => [LispVal] -> m LispVal
+  }
+
+instance Show IOPrimitive where
+  show (IOPrimitive _) = "<IO primitive>"
+
 data LispVal = Atom          String
              | List          [LispVal]
              | DottedList    [LispVal] LispVal
@@ -121,7 +129,9 @@ data LispVal = Atom          String
              | Character     Char
              | String        String
              | Bool          Bool
+             | Port          IO.Handle
              | PrimitiveFunc Primitive
+             | IOFunc        IOPrimitive
              | Func { params    :: [String]
                     , listParam :: Maybe String
                     , body      :: NE.NonEmpty LispVal
@@ -156,7 +166,9 @@ instance Show PrettyLispVal where
       showVal (Bool       False)   = "#f"
       showVal (List       ls)      = "(" ++ unwordsList ls ++ ")"
       showVal (DottedList hd tl)   = "(" ++ unwordsList hd ++ " . " ++ showVal tl ++ ")"
+      showVal (Port       _)       = "<IO port>"
       showVal (PrimitiveFunc prim) = show prim
+      showVal (IOFunc        prim) = show prim
       showVal (Func ps lp bd clsr) = "(lambda (" ++ unwords (show <$> ps)
                                   ++ maybe "" (" . " ++) lp ++ ") ...) "
                                   -- ++ show (PrettyLispVal <$> withoutPrimitive clsr)
@@ -344,7 +356,21 @@ parseExpr = choice
 withRem :: MonadParsec e s m => m a -> m (a, s)
 withRem parser = (,) <$> parser <*> getInput
 
-data LispError = NumArgs (Maybe String) Integer [LispVal]
+data ArgNum = ArgNumOr (NE.NonEmpty Integer)
+            | MoreThan Integer
+            deriving Eq
+
+instance Show ArgNum where
+  show (ArgNumOr ne1) = case NE.uncons $ NE.reverse ne1 of
+    (an1, Nothing            ) -> show an1
+    (an1, Just (an2 NE.:| ls)) -> foldr (\a b -> b ++ show a ++ ", ") "" ls
+                               ++ show an2 ++ " or " ++ show an1
+  show (MoreThan an) = "more than " ++ show an
+
+argNum :: [Integer] -> ArgNum
+argNum = ArgNumOr . NE.fromList
+
+data LispError = NumArgs (Maybe String) ArgNum [LispVal]
                | TypeMismatch String String LispVal
                | Parser ParserError
                | BadSpecialForm String LispVal
@@ -375,9 +401,15 @@ instance Show LispError where
 type WithLispErr a = Either LispError a
 type LispErrOrVal  = WithLispErr LispVal
 
-readExpr :: E.MonadError LispError m => String -> m LispVal
-readExpr input = either (E.throwError . Parser) return
-               $ runParser (parseExpr <* (sc >> eof)) "" input
+readOrThrow :: E.MonadError LispError m => String -> Parser a -> String -> m a
+readOrThrow file parser input = either (E.throwError . Parser) return
+                              $ runParser parser file input
+
+readExpr :: E.MonadError LispError m => String -> String -> m LispVal
+readExpr file = readOrThrow file $ parseExpr <* (sc >> eof)
+
+readExprList :: E.MonadError LispError m => String -> String -> m [LispVal]
+readExprList file = readOrThrow file $ (endBy parseExpr sc) <* eof
 
 type LispEnv            = HM.HashMap String LispVal
 type MonadWithLispEnv m = (MonadReader (IORef LispEnv) m, MonadIO m)
@@ -434,6 +466,9 @@ makeFunc mVar paramVals mListParamVal body = do
     unpackParams paramVals = either (E.throwError . NonSymbolParam mVar) return
                            $ traverse unpackAtom paramVals
 
+load :: (E.MonadError LispError m, MonadIO m) => String -> m [LispVal]
+load filePath = liftIO (readFile filePath) >>= readExprList filePath
+
 eval :: (E.MonadError LispError m, MonadWithLispEnv m) => LispVal -> m LispVal
 eval (Atom var)                            = getVar var
 eval (List [Atom "quote"     , val])       = return val
@@ -453,11 +488,14 @@ eval (List (Atom "lambda" : DottedList pVals lpVal : bodyHd : bodyTl)) =
   makeFunc Nothing    pVals (Just lpVal) (bodyHd NE.:| bodyTl)
 eval (List (Atom "lambda" : lpVal@(Atom _)         : bodyHd : bodyTl)) =
   makeFunc Nothing    []    (Just lpVal) (bodyHd NE.:| bodyTl)
+eval (List [Atom "load", String filePath])
+  = load filePath >>= fmap (foldr const (Bool False) . reverse) . traverse eval
 eval (List (function : args)) = do
                                   func    <- eval function
                                   argVals <- traverse eval args
                                   func `apply` argVals
-eval val = E.throwError $ BadSpecialForm "Unrecognized special form" val
+eval val = return val
+-- eval val = E.throwError $ BadSpecialForm "Unrecognized special form" val
 
 -- return remaining list
 zipWith' :: (a -> b -> c) -> [a] -> [b] -> ([c], Either [a] [b])
@@ -468,47 +506,25 @@ zipWith' f (a:as) (b:bs) = first (f a b :) $ zipWith' f as bs
 zip' :: [a] -> [b] -> ([(a, b)], Either [a] [b])
 zip' = zipWith' (,)
 
-onException :: E.MonadError e m => m a -> m b -> m a
-onException ma what = ma `E.catchError` \e -> what >> E.throwError e
-
-finally :: E.MonadError e m => m a -> m b -> m a
-finally ma sequel = (ma `onException` sequel) <* sequel
-
--- withTmpState :: (E.MonadError e m, MonadState s m) => s -> m a -> m a
--- withTmpState s ma = do
---   orig <- get
---   put s
---   ma `finally` put orig
-
-apply :: (E.MonadError LispError m, MonadWithLispEnv m)
+apply :: (E.MonadError LispError m, MonadIO m)
       => LispVal -> [LispVal] -> m LispVal
-apply (PrimitiveFunc prim) args = prim `appPrim` args
+apply (PrimitiveFunc prim) args = prim `appPrim`   args
+apply (IOFunc        prim) args = prim `appIOPrim` args
 apply (Func ps lp bd clsr) args = do
-  let numArgsErr = E.throwError $ NumArgs Nothing (toInteger $ length ps) args
+  let numArgsErr = E.throwError $ NumArgs Nothing (argNum [toInteger $ length ps]) args
   varArgs <- case zip' ps args of
                (_  , Left   _)            -> numArgsErr
                (pas, Right listArg@[])    -> maybe (return pas)
                  (\listParam -> return $ (listParam, List listArg) : pas) lp
                (pas, Right listArg@(_:_)) -> maybe numArgsErr
                  (\listParam -> return $ (listParam, List listArg) : pas) lp
-  val <- flip runReaderT clsr $ do
+  flip runReaderT clsr $ do
     bindVars $ HM.fromList varArgs
     NE.last <$> traverse eval bd
-  return val
-  -- modify (HM.union clsr)
-  -- get >>= T.traceM . ("before bindClosure: " ++) . showLispEnv
-  -- bindVars clsr
-  -- get >>= T.traceM . ("after bindClosure : " ++) . showLispEnv
-  -- bindVars $ HM.fromList varArgs
-  -- get >>= T.traceM . ("after bindVars    : " ++) . showLispEnv
-  -- NE.last <$> traverse eval bd
-  --
-  -- withTmpState clsr $ do
-  --   bindVars varArgs
-  --   NE.last <$> traverse eval bd
+apply func _ = E.throwError $ NotFunction "Not function" $ show $ PrettyLispVal func
 
-primitives :: [(String, Primitive)]
-primitives = (\(name, func) -> (name, func name)) <$>
+primitives :: LispEnv
+primitives = HM.fromList $ (\(name, func) -> (name, PrimitiveFunc $ func name)) <$>
   [ ("boolean?"      , isLispBool)
   , ("string?"       , isLispString)
   , ("char?"         , isLispCharacter)
@@ -528,62 +544,62 @@ isLispBool :: String -> Primitive
 isLispBool name = Primitive $ \case
   [Bool _] -> return       $ Bool True
   [_]      -> return       $ Bool False
-  args     -> E.throwError $ NumArgs (Just name) 1 args
+  args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isLispString :: String -> Primitive
 isLispString name = Primitive $ \case
   [String _] -> return       $ Bool True
   [_]        -> return       $ Bool False
-  args       -> E.throwError $ NumArgs (Just name) 1 args
+  args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isLispCharacter :: String -> Primitive
 isLispCharacter name = Primitive $ \case
   [Character _] -> return       $ Bool True
   [_]           -> return       $ Bool False
-  args          -> E.throwError $ NumArgs (Just name) 1 args
+  args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isLispList :: String -> Primitive
 isLispList name = Primitive $ \case
   [List _] -> return       $ Bool True
   [_]      -> return       $ Bool False
-  args     -> E.throwError $ NumArgs (Just name) 1 args
+  args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isLispDottedList :: String -> Primitive
 isLispDottedList name = Primitive $ \case
   [DottedList _ _] -> return       $ Bool True
   [_]              -> return       $ Bool False
-  args             -> E.throwError $ NumArgs (Just name) 1 args
+  args             -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isLispSymbol :: String -> Primitive
 isLispSymbol name = Primitive $ \case
   [Atom _] -> return       $ Bool True
   [_]      -> return       $ Bool False
-  args     -> E.throwError $ NumArgs (Just name) 1 args
+  args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 notLispBool :: String -> Primitive
 notLispBool name = Primitive $ \case
   [Bool True ] -> return       $ Bool False
   [Bool False] -> return       $ Bool True
   [_]          -> return       $ Bool False
-  args         -> E.throwError $ NumArgs (Just name) 1 args
+  args         -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isNullLispList :: String -> Primitive
 isNullLispList name = Primitive $ \case
   [List []] -> return       $ Bool True
   [_]       -> return       $ Bool False
-  args      -> E.throwError $ NumArgs (Just name) 1 args
+  args      -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 symbol2String :: String -> Primitive
 symbol2String name = Primitive $ \case
   [Atom name] -> return       $ String name
   [arg]       -> E.throwError $ TypeMismatch name "symbol" arg
-  args        -> E.throwError $ NumArgs (Just name) 1 args
+  args        -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 string2Symbol :: String -> Primitive
 string2Symbol name = Primitive $ \case
   [String str] -> return       $ Atom str
   [arg]        -> E.throwError $ TypeMismatch name "string" arg
-  args         -> E.throwError $ NumArgs (Just name) 1 args
+  args         -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 realBinOp :: forall rc. (forall a. Num a => a -> a -> a) -> Integer
           -> String -> Primitive
@@ -601,18 +617,75 @@ unpackReal (List [val])  = unpackReal val
 unpackReal _             = Integer $ CBReal 0
 -}
 
+ioPrimitives :: LispEnv
+ioPrimitives = HM.fromList $ (\(name, func) -> (name, IOFunc $ func name)) <$>
+  [ ("apply"            , applyProc)
+  , ("open-input-file"  , makePort IO.ReadMode)
+  , ("open-output-file" , makePort IO.WriteMode)
+  , ("close-input-file" , closePort)
+  , ("close-output-file", closePort)
+  , ("read"             , readProc)
+  , ("write"            , writeProc)
+  , ("read-contents"    , readContents)
+  ]
+
+applyProc :: String -> IOPrimitive
+applyProc name = IOPrimitive $ \case
+  [func, List args] -> apply func args
+  (func : args)     -> apply func args
+  args              -> E.throwError $ NumArgs (Just name) (MoreThan 2) args
+
+makePort :: IO.IOMode -> String -> IOPrimitive
+makePort mode name = IOPrimitive $ \case
+  [String filePath] -> Port <$> liftIO (IO.openFile filePath mode)
+  [arg]             -> E.throwError $ TypeMismatch name "string" arg
+  args              -> E.throwError $ NumArgs (Just name) (argNum [1]) args
+
+closePort :: String -> IOPrimitive
+closePort name = IOPrimitive $ \case
+  [Port port] -> liftIO $ IO.hClose port >> (return $ Bool True)
+  [arg]       -> E.throwError $ TypeMismatch name "port" arg
+  args        -> E.throwError $ NumArgs (Just name) (argNum [1]) args
+
+readProc :: String -> IOPrimitive
+readProc name = IOPrimitive $ \case
+  []          -> readProc name `appIOPrim` [Port IO.stdin]
+  [Port port] -> liftIO (IO.hGetLine port) >>= readExpr (show port)
+  [arg]       -> E.throwError $ TypeMismatch name "port" arg
+  args        -> E.throwError $ NumArgs (Just name) (argNum [0,1]) args
+
+writeProc :: String -> IOPrimitive
+writeProc name = IOPrimitive $ \case
+  [val]            -> writeProc name `appIOPrim` [val, Port IO.stdout]
+  [val, Port port] -> liftIO $ IO.hPrint port (PrettyLispVal val) >> return (Bool True)
+  [_  , arg      ] -> E.throwError $ TypeMismatch name "port" arg
+  args             -> E.throwError $ NumArgs (Just name) (argNum [1,2]) args
+
+readContents :: String -> IOPrimitive
+readContents name = IOPrimitive $ \case
+  [String filePath] -> String <$> liftIO (IO.readFile filePath)
+  [arg]             -> E.throwError $ TypeMismatch name "string" arg
+  args              -> E.throwError $ NumArgs (Just name) (argNum [1]) args
+
+readAll :: String -> IOPrimitive
+readAll name = IOPrimitive $ \case
+  [String filePath] -> List <$> load filePath
+
+showLispErrOrVal :: LispErrOrVal -> String
+showLispErrOrVal = either show (show . PrettyLispVal)
+
 printLispErrOrVal :: LispErrOrVal -> IO ()
-printLispErrOrVal = putStrLn . either show (show . PrettyLispVal)
+printLispErrOrVal = putStrLn . showLispErrOrVal
 
 prompt :: String -> IO String
-prompt prmpt = putStr prmpt >> hFlush stdout >> getLine
+prompt prmpt = putStr prmpt >> IO.hFlush IO.stdout >> getLine
 
 type WithLispEnv = ReaderT (IORef LispEnv)
 
 rep :: String -> WithLispEnv IO ()
 rep expr = do
   errOrVal <- E.runExceptT $ do
-    val <- readExpr expr
+    val <- readExpr "" expr
     eval val
   liftIO $ printLispErrOrVal errOrVal
 
@@ -621,11 +694,17 @@ repl = do
   liftIO $ putStrLn "~~~ Scheme REPL ~~~"
   forever $ liftIO (prompt "> ") >>= rep
 
+runOne :: NE.NonEmpty String -> WithLispEnv IO ()
+runOne (filePath NE.:| args) = do
+  bindVars $ HM.fromList $ [("args", List $ String <$> args)]
+  errOrVal <- E.runExceptT (eval $ List [Atom "load", String filePath])
+  liftIO $ IO.hPutStrLn IO.stderr $ showLispErrOrVal errOrVal
+
 main :: IO ()
 main = do
   global <- newIORef env
-  listToMaybe <$> getArgs >>= flip runReaderT global . maybe repl rep
+  NE.nonEmpty <$> getArgs >>= flip runReaderT global . maybe repl runOne
   where
-    env = HM.fromList $ second PrimitiveFunc <$> primitives
+    env = primitives <> ioPrimitives
 
 -- main = undefined
