@@ -113,15 +113,22 @@ data Primitive = Primitive
   }
 
 instance Show Primitive where
-  show (Primitive name _) = "<primitive: " ++ name ++ ">"
+  show prim = "<primitive: " ++ primName prim ++ ">"
 
-newtype IOPrimitive = IOPrimitive
-  { appIOPrim :: forall m. (E.MonadError LispError m, MonadIO m)
-              => [LispVal] -> m LispVal
+instance Eq Primitive where
+  prim1 == prim2 = primName prim1 == primName prim2
+
+data IOPrimitive = IOPrimitive
+  { ioPrimName :: String
+  , appIOPrim  :: forall m. (E.MonadError LispError m, MonadIO m)
+               => [LispVal] -> m LispVal
   }
 
 instance Show IOPrimitive where
-  show (IOPrimitive _) = "<IO primitive>"
+  show ioPrim = "<IO primitive: " ++ ioPrimName ioPrim ++ ">"
+
+instance Eq IOPrimitive where
+  ioPrim1 == ioPrim2 = ioPrimName ioPrim1 == ioPrimName ioPrim2
 
 data LispVal = Atom          String
              | List          [LispVal]
@@ -139,6 +146,7 @@ data LispVal = Atom          String
                     , body      :: NE.NonEmpty LispVal
                     , closure   :: IORef LispEnv
                     }
+             deriving Eq
              -- deriving Show -- TODO
 
 newtype PrettyLispVal = PrettyLispVal { unPrettyLispVal :: LispVal }
@@ -643,56 +651,62 @@ unpackReal func arg      = E.throwError $ TypeMismatch func "real number" arg
 
 ioPrimitives :: LispEnv
 ioPrimitives = HM.fromList $ (\(name, func) -> (name, IOFunc $ func name)) <$>
-  [ ("apply"            , applyProc)
-  , ("open-input-file"  , makePort IO.ReadMode)
-  , ("open-output-file" , makePort IO.WriteMode)
-  , ("close-input-file" , closePort)
-  , ("close-output-file", closePort)
-  , ("read"             , readProc)
-  , ("write"            , writeProc)
-  , ("read-contents"    , readContents)
-  ]
+  []
+  -- [ ("apply"            , applyProc)
+  -- , ("open-input-file"  , makePort IO.ReadMode)
+  -- , ("open-output-file" , makePort IO.WriteMode)
+  -- , ("close-input-file" , closePort)
+  -- , ("close-output-file", closePort)
+  -- , ("read"             , readProc)
+  -- , ("write"            , writeProc)
+  -- , ("read-contents"    , readContents)
+  -- ]
+
+ioPrimitive :: (String -> forall m. (E.MonadError LispError m, MonadIO m)
+                       => [LispVal] -> m LispVal)
+            -> String -> IOPrimitive
+ioPrimitive f name = IOPrimitive name (f name)
 
 applyProc :: String -> IOPrimitive
-applyProc name = IOPrimitive $ \case
+applyProc = ioPrimitive $ \name -> \case
   [func, List args] -> apply func args
   (func : args)     -> apply func args
   args              -> E.throwError $ NumArgs (Just name) (MoreThan 2) args
 
 makePort :: IO.IOMode -> String -> IOPrimitive
-makePort mode name = IOPrimitive $ \case
+makePort mode = ioPrimitive $ \name -> \case
   [String filePath] -> Port <$> liftIO (IO.openFile filePath mode)
   [arg]             -> E.throwError $ TypeMismatch name "string" arg
   args              -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 closePort :: String -> IOPrimitive
-closePort name = IOPrimitive $ \case
+closePort = ioPrimitive $ \name -> \case
   [Port port] -> liftIO $ IO.hClose port >> return (Bool True)
   [arg]       -> E.throwError $ TypeMismatch name "port" arg
   args        -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 readProc :: String -> IOPrimitive
-readProc name = IOPrimitive $ \case
+readProc = ioPrimitive $ \name -> \case
   []          -> readProc name `appIOPrim` [Port IO.stdin]
   [Port port] -> liftIO (IO.hGetLine port) >>= readExpr (show port)
   [arg]       -> E.throwError $ TypeMismatch name "port" arg
   args        -> E.throwError $ NumArgs (Just name) (argNum [0,1]) args
 
 writeProc :: String -> IOPrimitive
-writeProc name = IOPrimitive $ \case
+writeProc = ioPrimitive $ \name -> \case
   [val]            -> writeProc name `appIOPrim` [val, Port IO.stdout]
   [val, Port port] -> liftIO $ IO.hPrint port (PrettyLispVal val) >> return (Bool True)
   [_  , arg      ] -> E.throwError $ TypeMismatch name "port" arg
   args             -> E.throwError $ NumArgs (Just name) (argNum [1,2]) args
 
 readContents :: String -> IOPrimitive
-readContents name = IOPrimitive $ \case
+readContents = ioPrimitive $ \name -> \case
   [String filePath] -> String <$> liftIO (IO.readFile filePath)
   [arg]             -> E.throwError $ TypeMismatch name "string" arg
   args              -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 readAll :: String -> IOPrimitive
-readAll name = IOPrimitive $ \case
+readAll = ioPrimitive $ \name -> \case
   [String filePath] -> List <$> load filePath
 
 showLispErrOrVal :: LispErrOrVal -> String
