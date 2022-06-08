@@ -400,7 +400,8 @@ instance Show LispError where
   show (TypeMismatch fnc expctd fnd) = "Invalid type in "  ++ show fnc
                                     ++ "; expected "       ++ expctd
                                     ++ ", but found arg: " ++ show (PrettyLispVal fnd)
-  show (Parser parserErr)            = "Parse error:\n" ++ errorBundlePretty parserErr
+  show (Parser parserErr)            = "[Parse error]\n"
+                                    ++ errorBundlePretty parserErr
   show (NonSymbolParam func param)   = "Defining function " ++ funcName func
                                     ++ "with non symbol parameter: "
                                     ++ show (PrettyLispVal param)
