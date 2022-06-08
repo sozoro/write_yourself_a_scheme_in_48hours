@@ -564,8 +564,6 @@ primitives = HM.fromList $ (\(name, func) -> (name, PrimitiveFunc $ func name)) 
   , ("list?"         , isLispList)
   , ("pair?"         , isLispDottedList)
   , ("symbol?"       , isLispSymbol)
-  , ("not"           , notLispBool)
-  , ("null?"         , isNullLispList)
   , ("symbol->string", symbol2String)
   , ("string->symbol", string2Symbol)
   , ("car"           , lispCar)
@@ -618,19 +616,6 @@ isLispSymbol = primitive $ \name -> \case
   [Atom _] -> return       $ Bool True
   [_]      -> return       $ Bool False
   args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
-
-notLispBool :: String -> Primitive
-notLispBool = primitive $ \name -> \case
-  [Bool True ] -> return       $ Bool False
-  [Bool False] -> return       $ Bool True
-  [_]          -> return       $ Bool False
-  args         -> E.throwError $ NumArgs (Just name) (argNum [1]) args
-
-isNullLispList :: String -> Primitive
-isNullLispList = primitive $ \name -> \case
-  [List []] -> return       $ Bool True
-  [_]       -> return       $ Bool False
-  args      -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 symbol2String :: String -> Primitive
 symbol2String = primitive $ \name -> \case
