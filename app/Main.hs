@@ -107,11 +107,13 @@ binOpNumC op a b = match (upcast upper a) (upcast upper b)
     match (Double   (CBComp x)) (Double   (CBComp y)) = Double   $ x `op` y
     match _ _ = error "binOpNumR: match: upcast is broken"
 
-newtype Primitive = Primitive
-  { appPrim :: forall m. E.MonadError LispError m => [LispVal] -> m LispVal }
+data Primitive = Primitive
+  { primName :: String
+  , appPrim  :: forall m. E.MonadError LispError m => [LispVal] -> m LispVal
+  }
 
 instance Show Primitive where
-  show (Primitive _) = "<primitive>"
+  show (Primitive name _) = "<primitive: " ++ name ++ ">"
 
 newtype IOPrimitive = IOPrimitive
   { appIOPrim :: forall m. (E.MonadError LispError m, MonadIO m)
@@ -524,96 +526,120 @@ apply func _ = E.throwError $ NotFunction "Not function" $ show $ PrettyLispVal 
 primitives :: LispEnv
 primitives = HM.fromList $ (\(name, func) -> (name, PrimitiveFunc $ func name)) <$>
   [ ("boolean?"      , isLispBool)
-  , ("string?"       , isLispString)
-  , ("char?"         , isLispCharacter)
-  , ("list?"         , isLispList)
-  , ("pair?"         , isLispDottedList)
-  , ("symbol?"       , isLispSymbol)
-  , ("not"           , notLispBool)
-  , ("null?"         , isNullLispList)
-  , ("symbol->string", symbol2String)
-  , ("string->symbol", string2Symbol)
-  , ("+"             , realBinOp (+) 0)
-  , ("-"             , realBinOp (-) 0) -- TODO: broken
-  , ("*"             , realBinOp (*) 1)
+  -- , ("string?"       , isLispString)
+  -- , ("char?"         , isLispCharacter)
+  -- , ("list?"         , isLispList)
+  -- , ("pair?"         , isLispDottedList)
+  -- , ("symbol?"       , isLispSymbol)
+  -- , ("not"           , notLispBool)
+  -- , ("null?"         , isNullLispList)
+  -- , ("symbol->string", symbol2String)
+  -- , ("string->symbol", string2Symbol)
+  -- , ("car"           , lispCar)
+  -- , ("cdr"           , lispCdr)
+  -- , ("cons"          , lispCons)
+  -- , ("+"             , realBinOp (+) 0)
+  -- , ("-"             , realBinOp (-) 0) -- TODO: broken
+  -- , ("*"             , realBinOp (*) 1)
   ]
 
+primitive :: (String -> forall m. E.MonadError LispError m => [LispVal] -> m LispVal)
+          -> String -> Primitive
+primitive f name = Primitive name (f name)
+-- primitive f name = (Primitive <*> f) name -- error
+
 isLispBool :: String -> Primitive
-isLispBool name = Primitive $ \case
+isLispBool = primitive $ \name -> \case
   [Bool _] -> return       $ Bool True
   [_]      -> return       $ Bool False
   args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isLispString :: String -> Primitive
-isLispString name = Primitive $ \case
+isLispString = primitive $ \name -> \case
   [String _] -> return       $ Bool True
   [_]        -> return       $ Bool False
   args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isLispCharacter :: String -> Primitive
-isLispCharacter name = Primitive $ \case
+isLispCharacter = primitive $ \name -> \case
   [Character _] -> return       $ Bool True
   [_]           -> return       $ Bool False
   args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isLispList :: String -> Primitive
-isLispList name = Primitive $ \case
+isLispList = primitive $ \name -> \case
   [List _] -> return       $ Bool True
   [_]      -> return       $ Bool False
   args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isLispDottedList :: String -> Primitive
-isLispDottedList name = Primitive $ \case
+isLispDottedList = primitive $ \name -> \case
   [DottedList _ _] -> return       $ Bool True
   [_]              -> return       $ Bool False
   args             -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isLispSymbol :: String -> Primitive
-isLispSymbol name = Primitive $ \case
+isLispSymbol = primitive $ \name -> \case
   [Atom _] -> return       $ Bool True
   [_]      -> return       $ Bool False
   args     -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 notLispBool :: String -> Primitive
-notLispBool name = Primitive $ \case
+notLispBool = primitive $ \name -> \case
   [Bool True ] -> return       $ Bool False
   [Bool False] -> return       $ Bool True
   [_]          -> return       $ Bool False
   args         -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 isNullLispList :: String -> Primitive
-isNullLispList name = Primitive $ \case
+isNullLispList = primitive $ \name -> \case
   [List []] -> return       $ Bool True
   [_]       -> return       $ Bool False
   args      -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 symbol2String :: String -> Primitive
-symbol2String name = Primitive $ \case
+symbol2String = primitive $ \name -> \case
   [Atom name] -> return       $ String name
   [arg]       -> E.throwError $ TypeMismatch name "symbol" arg
   args        -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
 string2Symbol :: String -> Primitive
-string2Symbol name = Primitive $ \case
+string2Symbol = primitive $ \name -> \case
   [String str] -> return       $ Atom str
   [arg]        -> E.throwError $ TypeMismatch name "string" arg
   args         -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
+lispCar :: String -> Primitive
+lispCar = primitive $ \name -> \case
+  [List       (x : _)  ] -> return x
+  [DottedList (x : _) _] -> return x
+  [arg]                  -> E.throwError $ TypeMismatch name "pair" arg
+  args                   -> E.throwError $ NumArgs (Just name) (argNum [1]) args
+
+lispCdr :: String -> Primitive
+lispCdr = primitive $ \name -> \case
+  [List       (_ : xs)  ] -> return $ List xs
+  [DottedList [_]      l] -> return l
+  [DottedList (_ : xs) l] -> return $ DottedList xs l
+  [arg]                   -> E.throwError $ TypeMismatch name "pair" arg
+  args                    -> E.throwError $ NumArgs (Just name) (argNum [1]) args
+
+lispCons :: String -> Primitive
+lispCons = primitive $ \name -> \case
+  [x, List       xs  ] -> return $ List (x : xs)
+  [x, DottedList xs l] -> return $ DottedList (x : xs) l
+  [x, y]               -> return $ DottedList [x]      y
+  args                 -> E.throwError $ NumArgs (Just name) (argNum [1]) args
+
 realBinOp :: forall rc. (forall a. Num a => a -> a -> a) -> Integer
           -> String -> Primitive
-realBinOp op init name = Primitive $ \args ->
+realBinOp op init = primitive $ \name args ->
   Real . foldl (binOpNumR $ \x y -> CBReal $ x `op` y) (Integer $ CBReal init)
   <$> traverse (unpackReal name) args
 
 unpackReal :: E.MonadError LispError m => String -> LispVal -> m (Number 'R)
 unpackReal _    (Real r) = return r
 unpackReal func arg      = E.throwError $ TypeMismatch func "real number" arg
-{- Dynamic
-unpackReal (String str)  = either (const $ Integer $ CBReal 0) unpackReal $ readExpr str
-unpackReal (Character c) = either (const $ Integer $ CBReal 0) unpackReal $ readExpr [c]
-unpackReal (List [val])  = unpackReal val
-unpackReal _             = Integer $ CBReal 0
--}
 
 ioPrimitives :: LispEnv
 ioPrimitives = HM.fromList $ (\(name, func) -> (name, IOFunc $ func name)) <$>
