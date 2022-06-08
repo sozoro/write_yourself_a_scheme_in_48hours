@@ -13,7 +13,7 @@
 
 module Main where
 
-import Control.Applicative (Alternative,(<|>),empty)
+import Control.Applicative (Alternative,(<|>),empty,liftA2)
 -- import Control.Arrow (first,second)
 import Control.Monad -- (MonadPlus,mzero,mplus)
 import qualified Control.Monad.Except as E
@@ -158,11 +158,22 @@ unpackPrimitiveFunc :: LispVal -> Either LispVal Primitive
 unpackPrimitiveFunc (PrimitiveFunc prim) = return prim
 unpackPrimitiveFunc val                  = Left   val
 
-withoutPrimitive :: LispEnv -> LispEnv
-withoutPrimitive = HM.filter (isLeft . unpackPrimitiveFunc)
+unpackIOFunc :: LispVal -> Either LispVal IOPrimitive
+unpackIOFunc (IOFunc ioPrim) = return ioPrim
+unpackIOFunc val             = Left   val
 
-showLispEnv :: LispEnv -> String
-showLispEnv = show . fmap PrettyLispVal . withoutPrimitive
+freezeLispEnv :: LispEnv -> IO FrozenLispEnv
+freezeLispEnv = traverse readIORef
+
+withoutPrimitives :: FrozenLispEnv -> FrozenLispEnv
+withoutPrimitives = HM.filter $ liftA2 (&&) (isLeft . unpackPrimitiveFunc)
+                                            (isLeft . unpackIOFunc)
+
+showLispEnv :: IORef LispEnv -> IO String
+showLispEnv envRef = do
+  env  <- readIORef envRef
+  fEnv <- freezeLispEnv env
+  return $ show $ PrettyLispVal <$> withoutPrimitives fEnv
 
 instance Show PrettyLispVal where
   show = showVal . unPrettyLispVal
@@ -189,6 +200,12 @@ instance Show PrettyLispVal where
       showReal (Rational (CBReal r)) = show (numerator r) ++ "/" ++ show (denominator r)
       showReal (Float    (CBReal f)) = show f
       showReal (Double   (CBReal d)) = show d
+
+showValIO :: MonadIO m => LispVal -> m String
+showValIO val@(Func ps lp bd clsr) = do
+  str <- liftIO $ showLispEnv clsr
+  return $ show (PrettyLispVal val) ++ " " ++ str
+showValIO val = return $ show $ PrettyLispVal val
 
 maybeReal :: LispVal -> Maybe (Number 'R)
 maybeReal (Real r) = Just r
@@ -420,7 +437,8 @@ readExpr file = readOrThrow file $ parseExpr <* (sc >> eof)
 readExprList :: E.MonadError LispError m => String -> String -> m [LispVal]
 readExprList file = readOrThrow file $ endBy parseExpr sc <* eof
 
-type LispEnv            = HM.HashMap String LispVal
+type LispEnv            = HM.HashMap String (IORef LispVal)
+type FrozenLispEnv      = HM.HashMap String LispVal
 type MonadWithLispEnv m = (MonadReader (IORef LispEnv) m, MonadIO m)
 
 getLispEnv :: MonadWithLispEnv m => m LispEnv
@@ -432,31 +450,37 @@ putLispEnv env = ask >>= liftIO . flip writeIORef env
 modifyLispEnv :: MonadWithLispEnv m => (LispEnv -> LispEnv) -> m ()
 modifyLispEnv f = ask >>= liftIO . flip modifyIORef' f
 
-newLispEnv :: MonadWithLispEnv m => LispEnv -> m (IORef LispEnv)
-newLispEnv = liftIO . newIORef
-
-copyLispEnv :: MonadWithLispEnv m => m (IORef LispEnv)
-copyLispEnv = getLispEnv >>= newLispEnv
-
-isBound :: MonadWithLispEnv m => String -> m Bool
-isBound var = HM.member var <$> getLispEnv
-
 getVar :: (E.MonadError LispError m, MonadWithLispEnv m) => String -> m LispVal
 getVar var = getLispEnv >>=
-               maybe (E.throwError $ UnboundVar "Getting an unbound variable" var) return
+               maybe (E.throwError $ UnboundVar "Getting an unbound variable" var)
+                     (liftIO . readIORef)
                . HM.lookup var
+
+setVar' :: (MonadWithLispEnv m) => LispVal -> IORef LispVal -> m ()
+setVar' val valRef = liftIO (writeIORef valRef val)
 
 setVar :: (E.MonadError LispError m, MonadWithLispEnv m) => String -> LispVal -> m LispVal
 setVar var val = do
   env <- getLispEnv
-  if HM.member var env then putLispEnv (HM.insert var val env) >> return val
-                       else E.throwError $ UnboundVar "Setting an unbound variable" var
+  maybe (E.throwError $ UnboundVar "Setting an unbound variable" var) (setVar' val)
+        $ HM.lookup var env
+  return val
 
 defineVar :: MonadWithLispEnv m => String -> LispVal -> m LispVal
-defineVar var val = modifyLispEnv (HM.insert var val) >> return val
+defineVar var val = do
+  env <- getLispEnv
+  maybe (liftIO (newIORef val) >>= \valRef -> putLispEnv (HM.insert var valRef env))
+        (setVar' val)
+        $ HM.lookup var env
+  return val
 
-bindVars :: MonadWithLispEnv m => LispEnv -> m ()
-bindVars closure = modifyLispEnv $ \env -> HM.unionWith (\_ v -> v) env closure
+makeLispEnv :: MonadIO m => FrozenLispEnv -> m LispEnv
+makeLispEnv = liftIO . traverse newIORef
+
+bindVars :: MonadIO m => IORef LispEnv -> LispEnv -> m (IORef LispEnv)
+bindVars envRef bindings = do
+  env <- liftIO $ readIORef envRef
+  liftIO $ newIORef $ HM.unionWith const bindings env
 
 unpackAtom :: LispVal -> Either LispVal String
 unpackAtom (Atom atom) = return atom
@@ -468,7 +492,7 @@ makeFunc :: (E.MonadError LispError m, MonadWithLispEnv m)
 makeFunc mVar paramVals mListParamVal body = do
   params     <- unpackParams paramVals
   mListParam <- unpackParams mListParamVal
-  Func params mListParam body <$> copyLispEnv
+  asks $ Func params mListParam body
   where
     unpackParams :: (E.MonadError LispError m, Traversable t)
                  => t LispVal -> m (t String)
@@ -527,12 +551,12 @@ apply (Func ps lp bd clsr) args = do
                  (\listParam -> return $ (listParam, List listArg) : pas) lp
                (pas, Right listArg@(_:_)) -> maybe numArgsErr
                  (\listParam -> return $ (listParam, List listArg) : pas) lp
-  flip runReaderT clsr $ do
-    bindVars $ HM.fromList varArgs
+  env <- makeLispEnv (HM.fromList varArgs) >>= bindVars clsr
+  flip runReaderT env $ do
     NE.last <$> traverse eval bd
 apply func _ = E.throwError $ NotFunction "Not function" $ show $ PrettyLispVal func
 
-primitives :: LispEnv
+primitives :: FrozenLispEnv
 primitives = HM.fromList $ (\(name, func) -> (name, PrimitiveFunc $ func name)) <$>
   [ ("boolean?"      , isLispBool)
   , ("string?"       , isLispString)
@@ -657,7 +681,7 @@ unpackReal :: E.MonadError LispError m => String -> LispVal -> m (Number 'R)
 unpackReal _    (Real r) = return r
 unpackReal func arg      = E.throwError $ TypeMismatch func "real number" arg
 
-ioPrimitives :: LispEnv
+ioPrimitives :: FrozenLispEnv
 ioPrimitives = HM.fromList $ (\(name, func) -> (name, IOFunc $ func name)) <$>
   [ ("apply"            , applyProc)
   , ("open-input-file"  , makePort IO.ReadMode)
@@ -716,11 +740,12 @@ readAll :: String -> IOPrimitive
 readAll = ioPrimitive $ \name -> \case
   [String filePath] -> List <$> load filePath
 
-showLispErrOrVal :: LispErrOrVal -> String
-showLispErrOrVal = either show (show . PrettyLispVal)
+showLispErrOrVal :: LispErrOrVal -> IO String
+showLispErrOrVal = either (return . show) showValIO
+-- showLispErrOrVal = return . either show (show . PrettyLispVal)
 
 printLispErrOrVal :: LispErrOrVal -> IO ()
-printLispErrOrVal = putStrLn . showLispErrOrVal
+printLispErrOrVal eov  = putStrLn =<< showLispErrOrVal eov
 
 prompt :: String -> IO String
 prompt prmpt = putStr prmpt >> IO.hFlush IO.stdout >> getLine
@@ -741,15 +766,15 @@ repl = do
 
 runOne :: NE.NonEmpty String -> WithLispEnv IO ()
 runOne (filePath NE.:| args) = do
-  bindVars $ HM.fromList [("args", List $ String <$> args)]
+  bindings <- makeLispEnv $ HM.fromList [("args", List $ String <$> args)]
+  modifyLispEnv $ \env -> HM.unionWith const bindings env
   errOrVal <- E.runExceptT (eval $ List [Atom "load", String filePath])
-  liftIO $ IO.hPutStrLn IO.stderr $ showLispErrOrVal errOrVal
+  liftIO $ showLispErrOrVal errOrVal >>= IO.hPutStrLn IO.stderr
 
 main :: IO ()
 main = do
+  env    <- makeLispEnv $ primitives <> ioPrimitives
   global <- newIORef env
   getArgs >>= flip runReaderT global . maybe repl runOne . NE.nonEmpty
-  where
-    env = primitives <> ioPrimitives
 
 -- main = undefined
