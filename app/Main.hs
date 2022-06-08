@@ -534,21 +534,23 @@ apply func _ = E.throwError $ NotFunction "Not function" $ show $ PrettyLispVal 
 primitives :: LispEnv
 primitives = HM.fromList $ (\(name, func) -> (name, PrimitiveFunc $ func name)) <$>
   [ ("boolean?"      , isLispBool)
-  -- , ("string?"       , isLispString)
-  -- , ("char?"         , isLispCharacter)
-  -- , ("list?"         , isLispList)
-  -- , ("pair?"         , isLispDottedList)
-  -- , ("symbol?"       , isLispSymbol)
-  -- , ("not"           , notLispBool)
-  -- , ("null?"         , isNullLispList)
-  -- , ("symbol->string", symbol2String)
-  -- , ("string->symbol", string2Symbol)
-  -- , ("car"           , lispCar)
-  -- , ("cdr"           , lispCdr)
-  -- , ("cons"          , lispCons)
-  -- , ("+"             , realBinOp (+) 0)
-  -- , ("-"             , realBinOp (-) 0) -- TODO: broken
-  -- , ("*"             , realBinOp (*) 1)
+  , ("string?"       , isLispString)
+  , ("char?"         , isLispCharacter)
+  , ("list?"         , isLispList)
+  , ("pair?"         , isLispDottedList)
+  , ("symbol?"       , isLispSymbol)
+  , ("not"           , notLispBool)
+  , ("null?"         , isNullLispList)
+  , ("symbol->string", symbol2String)
+  , ("string->symbol", string2Symbol)
+  , ("car"           , lispCar)
+  , ("cdr"           , lispCdr)
+  , ("cons"          , lispCons)
+  , ("eq?"           , eqv)
+  , ("eqv?"          , eqv)
+  , ("+"             , realBinOp (+) 0)
+  , ("-"             , realBinOp (-) 0) -- TODO: broken
+  , ("*"             , realBinOp (*) 1)
   ]
 
 primitive :: (String -> forall m. E.MonadError LispError m => [LispVal] -> m LispVal)
@@ -639,6 +641,11 @@ lispCons = primitive $ \name -> \case
   [x, y]               -> return $ DottedList [x]      y
   args                 -> E.throwError $ NumArgs (Just name) (argNum [1]) args
 
+eqv :: String -> Primitive
+eqv = primitive $ \name -> \case
+  [x, y] -> return $ Bool $ x == y
+  args   -> E.throwError $ NumArgs (Just name) (argNum [2]) args
+
 realBinOp :: forall rc. (forall a. Num a => a -> a -> a) -> Integer
           -> String -> Primitive
 realBinOp op init = primitive $ \name args ->
@@ -651,16 +658,15 @@ unpackReal func arg      = E.throwError $ TypeMismatch func "real number" arg
 
 ioPrimitives :: LispEnv
 ioPrimitives = HM.fromList $ (\(name, func) -> (name, IOFunc $ func name)) <$>
-  []
-  -- [ ("apply"            , applyProc)
-  -- , ("open-input-file"  , makePort IO.ReadMode)
-  -- , ("open-output-file" , makePort IO.WriteMode)
-  -- , ("close-input-file" , closePort)
-  -- , ("close-output-file", closePort)
-  -- , ("read"             , readProc)
-  -- , ("write"            , writeProc)
-  -- , ("read-contents"    , readContents)
-  -- ]
+  [ ("apply"            , applyProc)
+  , ("open-input-file"  , makePort IO.ReadMode)
+  , ("open-output-file" , makePort IO.WriteMode)
+  , ("close-input-file" , closePort)
+  , ("close-output-file", closePort)
+  , ("read"             , readProc)
+  , ("write"            , writeProc)
+  , ("read-contents"    , readContents)
+  ]
 
 ioPrimitive :: (String -> forall m. (E.MonadError LispError m, MonadIO m)
                        => [LispVal] -> m LispVal)
