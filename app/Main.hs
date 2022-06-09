@@ -144,7 +144,7 @@ data LispVal = Atom          String
              | Func { params    :: [String]
                     , listParam :: Maybe String
                     , body      :: NE.NonEmpty LispVal
-                    , closure   :: IORef LispEnv
+                    , closure   :: LispEnv
                     }
              deriving Eq
              -- deriving Show -- TODO
@@ -162,18 +162,18 @@ unpackIOFunc :: LispVal -> Either LispVal IOPrimitive
 unpackIOFunc (IOFunc ioPrim) = return ioPrim
 unpackIOFunc val             = Left   val
 
-freezeLispEnv :: LispEnv -> IO FrozenLispEnv
-freezeLispEnv = traverse readIORef
+-- freezeLispEnv :: LispEnv -> IO FrozenLispEnv
+-- freezeLispEnv = traverse readIORef
 
-withoutPrimitives :: FrozenLispEnv -> FrozenLispEnv
+withoutPrimitives :: Scope -> Scope
 withoutPrimitives = HM.filter $ liftA2 (&&) (isLeft . unpackPrimitiveFunc)
                                             (isLeft . unpackIOFunc)
 
-showLispEnv :: IORef LispEnv -> IO String
-showLispEnv envRef = do
-  env  <- readIORef envRef
-  fEnv <- freezeLispEnv env
-  return $ show $ PrettyLispVal <$> withoutPrimitives fEnv
+showLispEnv :: LispEnv -> IO String
+showLispEnv envRefs = do
+  -- env  <- readIORef envRef
+  -- return $ show $ PrettyLispVal <$> withoutPrimitives env
+  undefined
 
 instance Show PrettyLispVal where
   show = showVal . unPrettyLispVal
@@ -437,10 +437,11 @@ readExpr file = readOrThrow file $ parseExpr <* (sc >> eof)
 readExprList :: E.MonadError LispError m => String -> String -> m [LispVal]
 readExprList file = readOrThrow file $ endBy parseExpr sc <* eof
 
-type LispEnv            = HM.HashMap String (IORef LispVal)
-type FrozenLispEnv      = HM.HashMap String LispVal
-type MonadWithLispEnv m = (MonadReader (IORef LispEnv) m, MonadIO m)
+type Scope              = HM.HashMap String LispVal
+type LispEnv            = NE.NonEmpty (IORef Scope)
+type MonadWithLispEnv m = (MonadReader LispEnv m, MonadIO m)
 
+{-
 getLispEnv :: MonadWithLispEnv m => m LispEnv
 getLispEnv = ask >>= liftIO . readIORef
 
@@ -449,13 +450,15 @@ putLispEnv env = ask >>= liftIO . flip writeIORef env
 
 modifyLispEnv :: MonadWithLispEnv m => (LispEnv -> LispEnv) -> m ()
 modifyLispEnv f = ask >>= liftIO . flip modifyIORef' f
+-}
 
 getVar :: (E.MonadError LispError m, MonadWithLispEnv m) => String -> m LispVal
-getVar var = getLispEnv >>=
+getVar var = undefined >>=
                maybe (E.throwError $ UnboundVar "Getting an unbound variable" var)
                      (liftIO . readIORef)
                . HM.lookup var
 
+{-
 setVar' :: (MonadWithLispEnv m) => LispVal -> IORef LispVal -> m ()
 setVar' val valRef = liftIO (writeIORef valRef val)
 
@@ -523,10 +526,15 @@ eval (List (Atom "lambda" : lpVal@(Atom _)         : bodyHd : bodyTl)) =
   makeFunc Nothing    []    (Just lpVal) (bodyHd NE.:| bodyTl)
 eval (List [Atom "load", String filePath])
   = load filePath >>= fmap (foldr const (Bool False) . reverse) . traverse eval
+eval (List [Atom "eval", val]) = eval val >>= eval
 eval (List (function : args)) = do
                                   func    <- eval function
                                   argVals <- traverse eval args
                                   func `apply` argVals
+                                -- TODO
+                                -- "apply" doesn't need existing environment
+                                -- so we should apply out of ReaderT (IORef LispEnv) _ _
+                                -- to avoid stretching monad stack
 eval val = return val
 -- eval val = E.throwError $ BadSpecialForm "Unrecognized special form" val
 
@@ -761,5 +769,6 @@ main = do
   env    <- makeLispEnv $ primitives <> ioPrimitives
   global <- newIORef env
   getArgs >>= flip runReaderT global . maybe repl runOne . NE.nonEmpty
+-}
 
--- main = undefined
+main = undefined
