@@ -441,49 +441,56 @@ type Scope              = HM.HashMap String LispVal
 type LispEnv            = NE.NonEmpty (IORef Scope)
 type MonadWithLispEnv m = (MonadReader LispEnv m, MonadIO m)
 
-{-
-getLispEnv :: MonadWithLispEnv m => m LispEnv
-getLispEnv = ask >>= liftIO . readIORef
+getUnifiedScope :: MonadWithLispEnv m => m Scope
+getUnifiedScope = do
+  env <- ask
+  liftIO $ foldMap readIORef env
 
-putLispEnv :: MonadWithLispEnv m => LispEnv -> m ()
-putLispEnv env = ask >>= liftIO . flip writeIORef env
+withScopeRef :: (MonadWithLispEnv m, Alternative f)
+             => (IORef Scope -> IO (f a)) -> m (f a)
+withScopeRef f = do
+  env <- ask
+  liftIO $ fmap choice $ traverse f env
 
-modifyLispEnv :: MonadWithLispEnv m => (LispEnv -> LispEnv) -> m ()
-modifyLispEnv f = ask >>= liftIO . flip modifyIORef' f
--}
+withTopScopeRef :: MonadWithLispEnv m => (IORef Scope -> IO a) -> m a
+withTopScopeRef f = do
+  env <- ask
+  liftIO $ f $ NE.head env
 
 getVar :: (E.MonadError LispError m, MonadWithLispEnv m) => String -> m LispVal
-getVar var = undefined >>=
-               maybe (E.throwError $ UnboundVar "Getting an unbound variable" var)
-                     (liftIO . readIORef)
-               . HM.lookup var
-
-{-
-setVar' :: (MonadWithLispEnv m) => LispVal -> IORef LispVal -> m ()
-setVar' val valRef = liftIO (writeIORef valRef val)
+getVar var = withScopeRef (fmap (HM.lookup var) . readIORef) >>=
+  maybe (E.throwError $ UnboundVar "Getting an unbound variable" var) return
 
 setVar :: (E.MonadError LispError m, MonadWithLispEnv m) => String -> LispVal -> m LispVal
 setVar var val = do
-  env <- getLispEnv
-  maybe (E.throwError $ UnboundVar "Setting an unbound variable" var) (setVar' val)
-        $ HM.lookup var env
-  return val
+  mb <- withScopeRef $ \ref -> do
+    scope <- readIORef ref
+    forM (HM.lookup var scope) $
+      const $ writeIORef ref (HM.insert var val scope) >> return val
+  maybe (E.throwError $ UnboundVar "Setting an unbound variable" var) return mb
 
+-- chez scheme:
+--
+-- > (define x 0)
+-- > x
+-- 0
+-- > (define (f y) (define x y) x)
+-- > (f 1)
+-- 1
+-- > x
+-- 0
 defineVar :: MonadWithLispEnv m => String -> LispVal -> m LispVal
 defineVar var val = do
-  env <- getLispEnv
-  maybe (liftIO (newIORef val) >>= \valRef -> putLispEnv (HM.insert var valRef env))
-        (setVar' val)
-        $ HM.lookup var env
+  withTopScopeRef $ flip modifyIORef $ HM.insert var val
   return val
 
-makeLispEnv :: MonadIO m => FrozenLispEnv -> m LispEnv
-makeLispEnv = liftIO . traverse newIORef
-
+{-
 bindVars :: MonadIO m => IORef LispEnv -> LispEnv -> m (IORef LispEnv)
 bindVars envRef bindings = do
+  undefined
   env <- liftIO $ readIORef envRef
   liftIO $ newIORef $ HM.unionWith const bindings env
+-}
 
 unpackAtom :: LispVal -> Either LispVal String
 unpackAtom (Atom atom) = return atom
@@ -493,9 +500,10 @@ makeFunc :: (E.MonadError LispError m, MonadWithLispEnv m)
          => Maybe String -> [LispVal] -> Maybe LispVal -> NE.NonEmpty LispVal
          -> m LispVal
 makeFunc mVar paramVals mListParamVal body = do
-  params     <- unpackParams paramVals
-  mListParam <- unpackParams mListParamVal
-  asks $ Func params mListParam body
+  params         <- unpackParams paramVals
+  mListParam     <- unpackParams mListParamVal
+  newTopScopeRef <- liftIO $ newIORef mempty
+  asks $ Func params mListParam body . NE.cons newTopScopeRef
   where
     unpackParams :: (E.MonadError LispError m, Traversable t)
                  => t LispVal -> m (t String)
@@ -559,12 +567,12 @@ apply (Func ps lp bd clsr) args = do
                  (\listParam -> return $ (listParam, List listArg) : pas) lp
                (pas, Right listArg@(_:_)) -> maybe numArgsErr
                  (\listParam -> return $ (listParam, List listArg) : pas) lp
-  env <- makeLispEnv (HM.fromList varArgs) >>= bindVars clsr
-  flip runReaderT env $ do
+  flip runReaderT clsr $ do
+    withTopScopeRef $ flip modifyIORef $ HM.union (HM.fromList varArgs)
     NE.last <$> traverse eval bd
 apply func _ = E.throwError $ NotFunction "Not function" $ show $ PrettyLispVal func
 
-primitives :: FrozenLispEnv
+primitives :: Scope
 primitives = HM.fromList $ (\(name, func) -> (name, PrimitiveFunc $ func name)) <$>
   [ ("boolean?"      , isLispBool)
   , ("string?"       , isLispString)
@@ -674,7 +682,7 @@ unpackReal :: E.MonadError LispError m => String -> LispVal -> m (Number 'R)
 unpackReal _    (Real r) = return r
 unpackReal func arg      = E.throwError $ TypeMismatch func "real number" arg
 
-ioPrimitives :: FrozenLispEnv
+ioPrimitives :: Scope
 ioPrimitives = HM.fromList $ (\(name, func) -> (name, IOFunc $ func name)) <$>
   [ ("apply"            , applyProc)
   , ("open-input-file"  , makePort IO.ReadMode)
@@ -743,11 +751,12 @@ printLispErrOrVal eov  = putStrLn =<< showLispErrOrVal eov
 prompt :: String -> IO String
 prompt prmpt = putStr prmpt >> IO.hFlush IO.stdout >> getLine
 
-type WithLispEnv = ReaderT (IORef LispEnv)
+type WithLispEnv = ReaderT LispEnv
 
 rep :: String -> WithLispEnv IO ()
 rep expr = do
   errOrVal <- E.runExceptT $ do
+    -- sequence (undefined :: WithLispEnv (E.ExceptT LispError IO) ())
     val <- readExpr "" expr
     eval val
   liftIO $ printLispErrOrVal errOrVal
@@ -759,16 +768,13 @@ repl = do
 
 runOne :: NE.NonEmpty String -> WithLispEnv IO ()
 runOne (filePath NE.:| args) = do
-  bindings <- makeLispEnv $ HM.fromList [("args", List $ String <$> args)]
-  modifyLispEnv $ \env -> HM.unionWith const bindings env
+  defineVar "args" $ List $ String <$> args
   errOrVal <- E.runExceptT (eval $ List [Atom "load", String filePath])
   liftIO $ showLispErrOrVal errOrVal >>= IO.hPutStrLn IO.stderr
 
 main :: IO ()
 main = do
-  env    <- makeLispEnv $ primitives <> ioPrimitives
-  global <- newIORef env
+  global <- fmap pure $ newIORef $ primitives <> ioPrimitives
   getArgs >>= flip runReaderT global . maybe repl runOne . NE.nonEmpty
--}
 
-main = undefined
+-- main = undefined
