@@ -523,6 +523,7 @@ eval (List (Atom "lambda" : lpVal@(Atom _)         : bodyHd : bodyTl)) =
   makeFunc Nothing    []    (Just lpVal) (bodyHd NE.:| bodyTl)
 eval (List [Atom "load", String filePath])
   = load filePath >>= fmap (foldr const (Bool False) . reverse) . traverse eval
+eval (List [Atom "eval", val]) = eval val >>= eval
 eval (List (function : args)) = do
                                   func    <- eval function
                                   argVals <- traverse eval args
